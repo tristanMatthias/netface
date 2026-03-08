@@ -154,8 +154,13 @@ pub struct ThemeRenderer {
     color_mode: ColorMode,
     /// Pre-computed colors for gradient/palette modes [256 entries].
     lum_to_color: [[u8; 3]; 256],
+    /// Pre-computed ANSI color sequences for luminance-based modes [256 entries].
+    /// Empty for Original/Tint modes (computed per-pixel).
+    lum_to_ansi: Vec<Vec<u8>>,
     /// Character width in terminal columns (1 for ASCII, 2 for emoji/wide chars).
     char_width: usize,
+    /// Whether we can use pre-computed ANSI sequences.
+    use_lum_ansi: bool,
 }
 
 impl ThemeRenderer {
@@ -194,16 +199,43 @@ impl ThemeRenderer {
         // Pre-compute colors for luminance values
         let lum_to_color = Self::build_color_table(&theme.color_mode);
 
+        // Pre-compute ANSI sequences for luminance-based color modes
+        let use_lum_ansi = matches!(
+            &theme.color_mode,
+            ColorMode::Monochrome { .. } | ColorMode::Gradient { .. } | ColorMode::Palette { .. }
+        );
+
+        let lum_to_ansi = if use_lum_ansi {
+            (0..256)
+                .map(|i| {
+                    let mut seq = Vec::with_capacity(19);
+                    seq.extend_from_slice(b"\x1b[38;2;");
+                    push_dec_fast(&mut seq, lum_to_color[i][0]);
+                    seq.push(b';');
+                    push_dec_fast(&mut seq, lum_to_color[i][1]);
+                    seq.push(b';');
+                    push_dec_fast(&mut seq, lum_to_color[i][2]);
+                    seq.push(b'm');
+                    seq
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Self {
             chars,
             lum_to_idx,
             color_mode: theme.color_mode.clone(),
             lum_to_color,
+            lum_to_ansi,
             char_width,
+            use_lum_ansi,
         }
     }
 
     /// Get the character width (1 for ASCII, 2 for emoji).
+    #[allow(dead_code)]
     pub fn char_width(&self) -> usize {
         self.char_width
     }
@@ -251,18 +283,20 @@ impl ThemeRenderer {
     }
 
     /// Render a single pixel to the output buffer.
-    #[inline]
+    #[inline(always)]
     pub fn render_pixel(&self, out: &mut Vec<u8>, r: u8, g: u8, b: u8) {
         let lum = fast_luminance(r, g, b);
         let char_idx = self.lum_to_idx[lum as usize] as usize;
-        // Safety: chars is guaranteed non-empty by constructor
-        let char_idx = if char_idx < self.chars.len() { char_idx } else { self.chars.len() - 1 };
-        let char_bytes = &self.chars[char_idx];
+        // Safety: char_idx is bounded by lum_to_idx construction
+        let char_bytes = unsafe { self.chars.get_unchecked(char_idx) };
 
-        let color = self.get_color(r, g, b, lum);
-
-        // Write ANSI color escape sequence
-        write_ansi_color(out, color);
+        // Use pre-computed ANSI sequence if available
+        if self.use_lum_ansi {
+            out.extend_from_slice(unsafe { self.lum_to_ansi.get_unchecked(lum as usize) });
+        } else {
+            let color = self.get_color(r, g, b, lum);
+            write_ansi_color(out, color);
+        }
         out.extend_from_slice(char_bytes);
     }
 
@@ -481,18 +515,39 @@ fn write_ansi_color(out: &mut Vec<u8>, color: [u8; 3]) {
     out.push(b'm');
 }
 
-/// Fast decimal push for u8.
+/// Pre-computed decimal strings for 0-255.
+static DECIMAL_STRINGS: [[u8; 3]; 256] = {
+    let mut table = [[0u8; 3]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        if i >= 100 {
+            table[i][0] = b'0' + (i / 100) as u8;
+            table[i][1] = b'0' + ((i / 10) % 10) as u8;
+            table[i][2] = b'0' + (i % 10) as u8;
+        } else if i >= 10 {
+            table[i][0] = b'0' + (i / 10) as u8;
+            table[i][1] = b'0' + (i % 10) as u8;
+            table[i][2] = 0;
+        } else {
+            table[i][0] = b'0' + i as u8;
+            table[i][1] = 0;
+            table[i][2] = 0;
+        }
+        i += 1;
+    }
+    table
+};
+
+/// Fast decimal push for u8 using lookup table.
 #[inline(always)]
 fn push_dec_fast(out: &mut Vec<u8>, v: u8) {
-    if v >= 100 {
-        out.push(b'0' + v / 100);
-        out.push(b'0' + (v / 10) % 10);
-        out.push(b'0' + v % 10);
-    } else if v >= 10 {
-        out.push(b'0' + v / 10);
-        out.push(b'0' + v % 10);
-    } else {
-        out.push(b'0' + v);
+    let digits = &DECIMAL_STRINGS[v as usize];
+    out.push(digits[0]);
+    if digits[1] != 0 {
+        out.push(digits[1]);
+        if digits[2] != 0 {
+            out.push(digits[2]);
+        }
     }
 }
 

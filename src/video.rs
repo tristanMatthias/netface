@@ -278,102 +278,207 @@ fn resize_gray_nearest(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh
     }
 }
 
+/// Pre-computed normalization table for RGB to float conversion.
+static RGB_TO_FLOAT: [f32; 256] = {
+    let mut table = [0.0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = i as f32 / 255.0;
+        i += 1;
+    }
+    table
+};
+
 /// Convert RGB bytes to normalized NCHW tensor.
 #[inline]
 fn rgb_to_nchw(rgb: &[u8], size: u32, out: &mut [f32]) {
     let size = size as usize;
     let plane = size * size;
-    let inv = 1.0 / 255.0;
 
     for y in 0..size {
         for x in 0..size {
             let i = (y * size + x) * 3;
             let pi = y * size + x;
-            out[pi] = rgb[i] as f32 * inv;
-            out[plane + pi] = rgb[i + 1] as f32 * inv;
-            out[2 * plane + pi] = rgb[i + 2] as f32 * inv;
+            out[pi] = RGB_TO_FLOAT[rgb[i] as usize];
+            out[plane + pi] = RGB_TO_FLOAT[rgb[i + 1] as usize];
+            out[2 * plane + pi] = RGB_TO_FLOAT[rgb[i + 2] as usize];
         }
     }
 }
 
-/// Fast morphological erosion (min filter).
+/// Fast morphological erosion using separable min filter.
 #[inline]
 fn erode(src: &[u8], dst: &mut [u8], w: u32, h: u32, r: i32) {
     let w = w as usize;
     let h = h as usize;
     let r = r as usize;
 
-    // Copy edges unchanged
-    dst.copy_from_slice(src);
+    if r == 0 {
+        dst.copy_from_slice(src);
+        return;
+    }
 
-    for y in r..(h - r) {
-        for x in r..(w - r) {
+    // Horizontal pass: src -> dst
+    for y in 0..h {
+        let row = y * w;
+        for x in 0..w {
+            let x_start = x.saturating_sub(r);
+            let x_end = (x + r + 1).min(w);
             let mut min = 255u8;
-            for ky in 0..=(r * 2) {
-                let row = (y + ky - r) * w;
-                for kx in 0..=(r * 2) {
-                    min = min.min(src[row + x + kx - r]);
-                }
+            for kx in x_start..x_end {
+                min = min.min(src[row + kx]);
             }
-            dst[y * w + x] = min;
+            dst[row + x] = min;
+        }
+    }
+
+    // Vertical pass: dst -> dst (in-place via temp storage per column)
+    for x in 0..w {
+        // First pass: compute all mins
+        let mut col_mins: Vec<u8> = Vec::with_capacity(h);
+        for y in 0..h {
+            let y_start = y.saturating_sub(r);
+            let y_end = (y + r + 1).min(h);
+            let mut min = 255u8;
+            for ky in y_start..y_end {
+                min = min.min(dst[ky * w + x]);
+            }
+            col_mins.push(min);
+        }
+        // Write back
+        for (y, &val) in col_mins.iter().enumerate() {
+            dst[y * w + x] = val;
         }
     }
 }
 
-/// Fast morphological dilation (max filter).
+/// Fast morphological dilation using separable max filter.
 #[inline]
 fn dilate(src: &[u8], dst: &mut [u8], w: u32, h: u32, r: i32) {
     let w = w as usize;
     let h = h as usize;
     let r = r as usize;
 
-    dst.copy_from_slice(src);
+    if r == 0 {
+        dst.copy_from_slice(src);
+        return;
+    }
 
-    for y in r..(h - r) {
-        for x in r..(w - r) {
+    // Horizontal pass: src -> dst
+    for y in 0..h {
+        let row = y * w;
+        for x in 0..w {
+            let x_start = x.saturating_sub(r);
+            let x_end = (x + r + 1).min(w);
             let mut max = 0u8;
-            for ky in 0..=(r * 2) {
-                let row = (y + ky - r) * w;
-                for kx in 0..=(r * 2) {
-                    max = max.max(src[row + x + kx - r]);
-                }
+            for kx in x_start..x_end {
+                max = max.max(src[row + kx]);
             }
-            dst[y * w + x] = max;
+            dst[row + x] = max;
+        }
+    }
+
+    // Vertical pass: dst -> dst (in-place via temp storage per column)
+    for x in 0..w {
+        let mut col_maxs: Vec<u8> = Vec::with_capacity(h);
+        for y in 0..h {
+            let y_start = y.saturating_sub(r);
+            let y_end = (y + r + 1).min(h);
+            let mut max = 0u8;
+            for ky in y_start..y_end {
+                max = max.max(dst[ky * w + x]);
+            }
+            col_maxs.push(max);
+        }
+        for (y, &val) in col_maxs.iter().enumerate() {
+            dst[y * w + x] = val;
         }
     }
 }
 
-/// Fast box blur (separable).
+/// Fast separable box blur - O(n*r) instead of O(n*r²).
 #[inline]
 fn box_blur(src: &[u8], dst: &mut [u8], w: u32, h: u32, r: usize) {
     let w = w as usize;
     let h = h as usize;
 
-    // Simple box blur (not separable for simplicity, but still fast)
+    if r == 0 {
+        dst.copy_from_slice(src);
+        return;
+    }
+
+    // Use dst as temporary buffer for horizontal pass
+    // Horizontal pass: src -> dst
     for y in 0..h {
-        for x in 0..w {
-            let mut sum = 0u32;
-            let mut count = 0u32;
+        let row_start = y * w;
+        let mut sum = 0u32;
+        let mut count = 0u32;
 
-            let y_start = y.saturating_sub(r);
-            let y_end = (y + r + 1).min(h);
-            let x_start = x.saturating_sub(r);
-            let x_end = (x + r + 1).min(w);
+        // Initialize window
+        for x in 0..=r.min(w - 1) {
+            sum += src[row_start + x] as u32;
+            count += 1;
+        }
+        dst[row_start] = (sum / count) as u8;
 
-            for ky in y_start..y_end {
-                let row = ky * w;
-                for kx in x_start..x_end {
-                    sum += src[row + kx] as u32;
-                    count += 1;
-                }
+        // Slide window
+        for x in 1..w {
+            // Add right edge
+            let right = x + r;
+            if right < w {
+                sum += src[row_start + right] as u32;
+                count += 1;
             }
+            // Remove left edge
+            let left = x as isize - r as isize - 1;
+            if left >= 0 {
+                sum -= src[row_start + left as usize] as u32;
+                count -= 1;
+            }
+            dst[row_start + x] = (sum / count) as u8;
+        }
+    }
 
-            dst[y * w + x] = (sum / count) as u8;
+    // Vertical pass: dst -> src (we'll copy back to dst)
+    // We need another buffer, so we do it in-place column by column
+    for x in 0..w {
+        let mut sum = 0u32;
+        let mut count = 0u32;
+
+        // Initialize window
+        for y in 0..=r.min(h - 1) {
+            sum += dst[y * w + x] as u32;
+            count += 1;
+        }
+        let first_val = (sum / count) as u8;
+
+        // Slide window and store temporarily
+        let mut col_vals = Vec::with_capacity(h);
+        col_vals.push(first_val);
+
+        for y in 1..h {
+            let bottom = y + r;
+            if bottom < h {
+                sum += dst[bottom * w + x] as u32;
+                count += 1;
+            }
+            let top = y as isize - r as isize - 1;
+            if top >= 0 {
+                sum -= dst[top as usize * w + x] as u32;
+                count -= 1;
+            }
+            col_vals.push((sum / count) as u8);
+        }
+
+        // Write back
+        for (y, &val) in col_vals.iter().enumerate() {
+            dst[y * w + x] = val;
         }
     }
 }
 
 /// Composite foreground with background using mask and contrast enhancement.
+/// Uses fixed-point arithmetic for better performance.
 #[inline]
 fn composite_with_contrast(
     src: &[u8],
@@ -387,25 +492,36 @@ fn composite_with_contrast(
 ) {
     let w = w as usize;
     let h = h as usize;
-    let bg_f = [bg[0] as f32, bg[1] as f32, bg[2] as f32];
+
+    // Pre-compute contrast lookup table (256 entries)
+    let mut contrast_lut = [0i16; 256];
+    for i in 0..256 {
+        let val = ((i as f32 - mid) * contrast + mid).clamp(0.0, 255.0);
+        contrast_lut[i] = val as i16;
+    }
+
+    // Fixed-point background (8.8 format)
+    let bg_r = (bg[0] as i32) << 8;
+    let bg_g = (bg[1] as i32) << 8;
+    let bg_b = (bg[2] as i32) << 8;
 
     for y in 0..h {
         let row = y * w;
         for x in 0..w {
             let i = row + x;
             let si = i * 3;
-            let alpha = mask[i] as f32 * (1.0 / 255.0);
-            let inv_alpha = 1.0 - alpha;
+            let alpha = mask[i] as i32; // 0-255
+            let inv_alpha = 255 - alpha;
 
-            // Contrast-enhanced foreground
-            let r = ((src[si] as f32 - mid) * contrast + mid).clamp(0.0, 255.0);
-            let g = ((src[si + 1] as f32 - mid) * contrast + mid).clamp(0.0, 255.0);
-            let b = ((src[si + 2] as f32 - mid) * contrast + mid).clamp(0.0, 255.0);
+            // Contrast-enhanced foreground via LUT
+            let r = contrast_lut[src[si] as usize] as i32;
+            let g = contrast_lut[src[si + 1] as usize] as i32;
+            let b = contrast_lut[src[si + 2] as usize] as i32;
 
-            // Alpha blend
-            dst[si] = (r * alpha + bg_f[0] * inv_alpha) as u8;
-            dst[si + 1] = (g * alpha + bg_f[1] * inv_alpha) as u8;
-            dst[si + 2] = (b * alpha + bg_f[2] * inv_alpha) as u8;
+            // Alpha blend using fixed-point (result >> 8)
+            dst[si] = ((r * alpha + (bg_r >> 8) * inv_alpha) >> 8) as u8;
+            dst[si + 1] = ((g * alpha + (bg_g >> 8) * inv_alpha) >> 8) as u8;
+            dst[si + 2] = ((b * alpha + (bg_b >> 8) * inv_alpha) >> 8) as u8;
         }
     }
 }
