@@ -7,14 +7,11 @@ use crossbeam_channel::{Receiver, Sender};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 
-/// Maximum samples to buffer for playback (~0.5 s at 48 kHz).
-const MAX_BUF: usize = 24_000;
-
-pub fn audio_loop(send_tx: Sender<Vec<u8>>, recv_rx: Receiver<Vec<u8>>) {
+pub fn audio_loop(send_tx: Sender<Vec<u8>>, recv_rx: Receiver<Vec<u8>>, buffer_size: usize) {
     let host = cpal::default_host();
 
     // Ring buffer fed by the network receive thread, drained by the output callback.
-    let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_BUF)));
+    let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(buffer_size)));
 
     // Thread: network bytes → ring buffer
     {
@@ -22,7 +19,7 @@ pub fn audio_loop(send_tx: Sender<Vec<u8>>, recv_rx: Receiver<Vec<u8>>) {
         thread::spawn(move || loop {
             if let Ok(bytes) = recv_rx.recv() {
                 let mut buf = ring.lock().unwrap();
-                if buf.len() < MAX_BUF {
+                if buf.len() < buffer_size {
                     for chunk in bytes.chunks_exact(4) {
                         buf.push_back(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                     }

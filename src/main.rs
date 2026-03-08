@@ -9,13 +9,9 @@
 //   The moment their first packet arrives the view snaps to a 50/50
 //   left (you) / right (them) split automatically.
 //
-// CROSS-COMPILE EXAMPLES
-//   macOS arm64 : cargo build --release --target aarch64-apple-darwin
-//   macOS x86   : cargo build --release --target x86_64-apple-darwin
-//   Linux x86   : cargo build --release --target x86_64-unknown-linux-gnu
-//   Windows     : cargo build --release --target x86_64-pc-windows-gnu
-//
-// LINUX: needs libasound2-dev (ALSA).  macOS: camera/mic prompts on first run.
+// CONFIG
+//   Settings are loaded from ~/.config/netface/config.toml
+//   Run with --init-config to create a default config file.
 
 use std::io::Write;
 use std::net::UdpSocket;
@@ -30,8 +26,11 @@ use clap::Parser;
 use crossbeam_channel::bounded;
 
 mod audio;
+mod config;
 mod net;
 mod video;
+
+use config::Config;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -41,19 +40,19 @@ mod video;
 struct Args {
     /// Peer address, e.g. 192.168.1.42:4444
     #[arg(short, long)]
-    peer: String,
+    peer: Option<String>,
 
     /// Local UDP port to listen on
-    #[arg(short = 'P', long, default_value = "4444")]
-    port: u16,
+    #[arg(short = 'P', long)]
+    port: Option<u16>,
 
     /// Webcam device index (0 = default)
-    #[arg(short, long, default_value = "0")]
-    camera: usize,
+    #[arg(short, long)]
+    camera: Option<usize>,
 
     /// Target capture FPS
-    #[arg(short, long, default_value = "15")]
-    fps: u64,
+    #[arg(short, long)]
+    fps: Option<u64>,
 
     /// ANSI truecolor output (richer image, bigger packets)
     #[arg(short = 'C', long)]
@@ -62,59 +61,140 @@ struct Args {
     /// Disable audio
     #[arg(long)]
     no_audio: bool,
+
+    /// Enable background removal (requires more CPU)
+    #[arg(short = 'b', long)]
+    bg_removal: bool,
+
+    /// Background color when removal is enabled (hex RGB, e.g., "000000" for black)
+    #[arg(long)]
+    bg_color: Option<String>,
+
+    /// Create default config file at ~/.config/netface/config.toml
+    #[arg(long)]
+    init_config: bool,
+
+    /// Print example config to stdout
+    #[arg(long)]
+    example_config: bool,
 }
 
 fn main() {
     let args = Args::parse();
+
+    // Handle config commands
+    if args.example_config {
+        print!("{}", config::example_config());
+        return;
+    }
+
+    if args.init_config {
+        match Config::save_default() {
+            Ok(path) => {
+                println!("Created config file at: {}", path.display());
+                println!("Edit this file to customize settings.");
+            }
+            Err(e) => {
+                eprintln!("Failed to create config file: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Require peer address for normal operation
+    let peer_str = args.peer.unwrap_or_else(|| {
+        eprintln!("Error: --peer is required");
+        eprintln!("Usage: netface --peer <host:port>");
+        eprintln!("Run with --help for more options");
+        std::process::exit(1);
+    });
+
+    // Load config from file, then override with CLI args
+    let mut cfg = Config::load();
+
+    // Override config with CLI args where provided
+    if let Some(port) = args.port {
+        cfg.port = port;
+    }
+    if let Some(camera) = args.camera {
+        cfg.camera = camera;
+    }
+    if let Some(fps) = args.fps {
+        cfg.fps = fps;
+    }
+    if args.color {
+        cfg.color = true;
+    }
+    if args.no_audio {
+        cfg.no_audio = true;
+    }
+    if args.bg_removal {
+        cfg.bg_removal = true;
+    }
+    if let Some(bg_color) = args.bg_color {
+        cfg.bg_color = bg_color;
+    }
+
+    // Parse derived values
+    let bg_color = cfg.bg_color_rgb();
 
     // ── Terminal dimensions ───────────────────────────────────────────────
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let term_cols = term_cols as u32;
     let term_rows = term_rows as u32;
 
-    // Each panel is half the terminal width; the separator takes one column.
-    //   cols:  [local: half_w] [│] [remote: half_w]  (total = half_w*2 + 1)
     let half_w = term_cols.saturating_sub(1) / 2;
-    // Reserve one row for the status bar at the bottom.
     let height = term_rows.saturating_sub(1);
 
     // ── Terminal setup ────────────────────────────────────────────────────
-    print!("\x1b[?25l\x1b[2J\x1b[H"); // hide cursor, clear, home
+    print!("\x1b[?25l\x1b[2J\x1b[H");
     std::io::stdout().flush().unwrap();
 
     ctrlc::set_handler(|| {
-        print!("\x1b[?25h\x1b[2J\x1b[H"); // restore cursor + clear on exit
+        print!("\x1b[?25h\x1b[2J\x1b[H");
         std::io::stdout().flush().ok();
         std::process::exit(0);
     })
     .expect("failed to set Ctrl-C handler");
 
     // ── Network ───────────────────────────────────────────────────────────
-    let peer_addr: std::net::SocketAddr = args
-        .peer
+    let peer_addr: std::net::SocketAddr = peer_str
         .parse()
-        .unwrap_or_else(|_| panic!("invalid peer address '{}' (expected host:port)", args.peer));
+        .unwrap_or_else(|_| panic!("invalid peer address '{}' (expected host:port)", peer_str));
 
-    let send_sock =
-        Arc::new(UdpSocket::bind("0.0.0.0:0").expect("failed to bind send socket"));
+    let send_sock = Arc::new(UdpSocket::bind("0.0.0.0:0").expect("failed to bind send socket"));
     let recv_sock = Arc::new(
-        UdpSocket::bind(format!("0.0.0.0:{}", args.port))
-            .unwrap_or_else(|e| panic!("failed to listen on port {}: {e}", args.port)),
+        UdpSocket::bind(format!("0.0.0.0:{}", cfg.port))
+            .unwrap_or_else(|e| panic!("failed to listen on port {}: {e}", cfg.port)),
     );
 
+    // ── Background removal ─────────────────────────────────────────────────
+    let bg_session: Option<Arc<std::sync::Mutex<ort::session::Session>>> = if cfg.bg_removal {
+        match video::load_bg_session(cfg.model_threads) {
+            Ok(s) => {
+                eprintln!("Background removal enabled");
+                Some(Arc::new(std::sync::Mutex::new(s)))
+            }
+            Err(e) => {
+                eprintln!("Failed to load background model: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Shared state ──────────────────────────────────────────────────────
-    // Flipped to `true` by the receive thread the moment the first video
-    // packet arrives; read by the compositor to trigger the split transition.
     let peer_connected = Arc::new(AtomicBool::new(false));
-    // Peer's requested display dimensions (updated by recv_loop from config packets).
     let peer_w = Arc::new(AtomicU32::new(half_w));
     let peer_h = Arc::new(AtomicU32::new(height));
 
     // ── Channels ──────────────────────────────────────────────────────────
-    let (display_tx, display_rx) = bounded::<video::RawFrame>(2); // capture → compositor
-    let (net_raw_tx, net_raw_rx) = bounded::<video::RawFrame>(2); // capture → encoder
-    let (vid_tx, vid_rx) = bounded::<Vec<u8>>(2);                 // encoder → net send
-    let (remote_vid_tx, remote_vid_rx) = bounded::<Vec<u8>>(2);   // net recv → compositor
+    let (display_tx, display_rx) = bounded::<video::RawFrame>(2);
+    let (net_raw_tx, net_raw_rx) = bounded::<video::RawFrame>(2);
+    let (vid_tx, vid_rx) = bounded::<Vec<u8>>(2);
+    let (remote_vid_tx, remote_vid_rx) = bounded::<Vec<u8>>(2);
     let (local_aud_tx, local_aud_rx) = bounded::<Vec<u8>>(32);
     let (remote_aud_tx, remote_aud_rx) = bounded::<Vec<u8>>(32);
 
@@ -130,44 +210,62 @@ fn main() {
     // ── Network send ──────────────────────────────────────────────────────
     {
         let sock = send_sock.clone();
-        thread::spawn(move || net::send_loop(sock, peer_addr, vid_rx, local_aud_rx, half_w, height));
+        let config_interval = cfg.config_interval;
+        thread::spawn(move || {
+            net::send_loop(sock, peer_addr, vid_rx, local_aud_rx, half_w, height, config_interval)
+        });
     }
 
     // ── Camera capture ────────────────────────────────────────────────────
-    // Capture at native resolution (no resize).
     {
-        let (cam, fps) = (args.camera, args.fps);
-        thread::spawn(move || video::capture_thread(cam, fps, display_tx, net_raw_tx));
+        let camera_idx = cfg.camera;
+        let fps = cfg.fps;
+        thread::spawn(move || video::capture_thread(camera_idx, fps, display_tx, net_raw_tx));
     }
 
-    // ── Network encoder (RawFrame → ASCII → lz4 → UDP) ───────────────────
-    // Uses peer's requested dimensions for cropping and ASCII conversion.
+    // ── Network encoder ───────────────────────────────────────────────────
     {
-        let color = args.color;
+        let color = cfg.color;
         let pw = peer_w.clone();
         let ph = peer_h.clone();
-        thread::spawn(move || video::net_encode_thread(net_raw_rx, vid_tx, pw, ph, color));
+        let bgs = bg_session.clone();
+        let video_cfg = video::VideoConfig::from(&cfg);
+        thread::spawn(move || {
+            video::net_encode_thread(net_raw_rx, vid_tx, pw, ph, color, bgs, bg_color, video_cfg)
+        });
     }
 
     // ── Compositor ────────────────────────────────────────────────────────
-    // Solo until peer_connected flips; then snaps to 50/50 split.
     {
         let pc = peer_connected.clone();
-        let color = args.color;
+        let color = cfg.color;
+        let bgs = bg_session.clone();
+        let video_cfg = video::VideoConfig::from(&cfg);
         thread::spawn(move || {
-            video::compositor_thread(display_rx, remote_vid_rx, pc, half_w, height, color)
+            video::compositor_thread(
+                display_rx,
+                remote_vid_rx,
+                pc,
+                half_w,
+                height,
+                color,
+                bgs,
+                bg_color,
+                video_cfg,
+            )
         });
     }
 
     // ── Audio ─────────────────────────────────────────────────────────────
-    if !args.no_audio {
-        thread::spawn(move || audio::audio_loop(local_aud_tx, remote_aud_rx));
+    if !cfg.no_audio {
+        let audio_buffer = cfg.audio_buffer_size;
+        thread::spawn(move || audio::audio_loop(local_aud_tx, remote_aud_rx, audio_buffer));
     }
 
     // ── Status bar ────────────────────────────────────────────────────────
     {
-        let peer = args.peer.clone();
-        let port = args.port;
+        let peer = peer_str.clone();
+        let port = cfg.port;
         let pc = peer_connected.clone();
         let status_row = term_rows as u16;
 
