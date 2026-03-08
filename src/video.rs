@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,19 +12,54 @@ use nokhwa::Camera;
 
 const CHARS: &[u8] = b" `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 
-/// Raw resized frame shared between compositor and network encoder.
+/// Terminal characters are roughly 2x taller than wide.
+const CHAR_ASPECT: f32 = 2.0;
+
+/// Scale image to cover target dimensions (like CSS background-size: cover),
+/// accounting for terminal character aspect ratio, then crop center.
+fn crop_center(
+    img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    target_w: u32,
+    target_h: u32,
+) -> image::ImageBuffer<image::Rgb<u8>, Vec<u8>> {
+    let src_w = img.width() as f32;
+    let src_h = img.height() as f32;
+
+    // Target in visual pixel space (accounting for char aspect)
+    let visual_w = target_w as f32;
+    let visual_h = target_h as f32 * CHAR_ASPECT;
+
+    // Scale factor to cover visual target
+    let scale = (visual_w / src_w).max(visual_h / src_h);
+
+    let scaled_w = (src_w * scale).round() as u32;
+    let scaled_h = (src_h * scale).round() as u32;
+
+    // Scale the image
+    let scaled = imageops::resize(img, scaled_w, scaled_h, imageops::FilterType::Nearest);
+
+    // Crop center - but we need target_h rows worth of pixels (which is target_h * CHAR_ASPECT)
+    let crop_h_pixels = (target_h as f32 * CHAR_ASPECT).round() as u32;
+    let crop_x = (scaled_w.saturating_sub(target_w)) / 2;
+    let crop_y = (scaled_h.saturating_sub(crop_h_pixels)) / 2;
+
+    let cropped = imageops::crop_imm(&scaled, crop_x, crop_y, target_w, crop_h_pixels).to_image();
+
+    // Squash vertically to terminal rows
+    imageops::resize(&cropped, target_w, target_h, imageops::FilterType::Nearest)
+}
+
+/// Raw frame from camera (native resolution).
 pub type RawFrame = image::ImageBuffer<image::Rgb<u8>, Vec<u8>>;
 
 // ---------------------------------------------------------------------------
 // Capture thread
 // ---------------------------------------------------------------------------
 
-/// Grabs webcam frames, resizes to `half_w × height`, and broadcasts to
+/// Grabs webcam frames at native resolution and broadcasts to
 /// the compositor and the network encoder.
 pub fn capture_thread(
     camera_idx: usize,
-    half_w: u32,
-    height: u32,
     fps: u64,
     display_tx: Sender<RawFrame>, // → compositor
     net_tx: Sender<RawFrame>,     // → network encoder
@@ -55,7 +90,7 @@ pub fn capture_thread(
             }
         };
 
-        let rgb = match raw.decode_image::<RgbFormat>() {
+        let mut rgb = match raw.decode_image::<RgbFormat>() {
             Ok(img) => img,
             Err(e) => {
                 eprintln!("decode error: {e}");
@@ -63,10 +98,10 @@ pub fn capture_thread(
             }
         };
 
-        // One resize to half_w — cloned for both consumers.
-        let small = imageops::resize(&rgb, half_w, height, imageops::FilterType::Nearest);
-        let _ = display_tx.try_send(small.clone());
-        let _ = net_tx.try_send(small);
+        // Flip horizontally (mirror effect).
+        imageops::flip_horizontal_in_place(&mut rgb);
+        let _ = display_tx.try_send(rgb.clone());
+        let _ = net_tx.try_send(rgb);
     }
 }
 
@@ -74,24 +109,32 @@ pub fn capture_thread(
 // Network encoder thread
 // ---------------------------------------------------------------------------
 
-/// Converts raw frames → ASCII → lz4 for transmission.
+/// Converts raw frames → crop center → ASCII → lz4 for transmission.
+/// Uses peer's requested dimensions for cropping.
 pub fn net_encode_thread(
     frame_rx: Receiver<RawFrame>,
     vid_tx: Sender<Vec<u8>>,
-    half_w: u32,
-    height: u32,
+    peer_w: Arc<AtomicU32>,
+    peer_h: Arc<AtomicU32>,
     color: bool,
 ) {
-    let cap = (half_w as usize + 1) * height as usize * if color { 22 } else { 1 };
-    let mut ascii = String::with_capacity(cap);
+    let mut ascii = String::with_capacity(64 * 1024);
 
     loop {
         if let Ok(frame) = frame_rx.recv() {
+            let w = peer_w.load(Ordering::Relaxed);
+            let h = peer_h.load(Ordering::Relaxed);
+
+            // Crop center of camera frame to peer's requested dimensions.
+            let cropped = crop_center(&frame, w, h);
+
             ascii.clear();
+            let actual_w = cropped.width();
+            let actual_h = cropped.height();
             if color {
-                frame_to_color_ascii(&frame, half_w, height, &mut ascii);
+                frame_to_color_ascii(&cropped, actual_w, actual_h, &mut ascii);
             } else {
-                frame_to_ascii(&frame, half_w, height, &mut ascii);
+                frame_to_ascii(&cropped, actual_w, actual_h, &mut ascii);
             }
             let compressed = lz4_flex::compress_prepend_size(ascii.as_bytes());
             let _ = vid_tx.try_send(compressed);
@@ -105,7 +148,7 @@ pub fn net_encode_thread(
 
 /// Renders the terminal display.
 ///
-/// • Solo mode  (peer not yet connected): local cam upscaled to full width.
+/// • Solo mode  (peer not yet connected): local cam cropped to full width.
 /// • Split mode (peer connected):         local on left half, remote on right.
 ///
 /// Transitions between modes automatically when `peer_connected` flips.
@@ -170,27 +213,33 @@ pub fn compositor_thread(
 
         if connected {
             // ── Split mode ──────────────────────────────────────────────
+            // Crop local frame to display size.
+            let local_cropped = crop_center(frame, half_w, height);
             ascii_buf.clear();
+            let w = local_cropped.width();
+            let h = local_cropped.height();
             if color {
-                frame_to_color_ascii(frame, half_w, height, &mut ascii_buf);
+                frame_to_color_ascii(&local_cropped, w, h, &mut ascii_buf);
             } else {
-                frame_to_ascii(frame, half_w, height, &mut ascii_buf);
+                frame_to_ascii(&local_cropped, w, h, &mut ascii_buf);
             }
             render_panel(&mut stdout, ascii_buf.as_bytes(), 1, half_w, height);
 
             if let Some(ref rb) = remote_bytes {
+                // Remote video is already sized for us, just render it.
                 render_panel(&mut stdout, rb, remote_col, half_w, height);
             }
         } else {
             // ── Solo mode ───────────────────────────────────────────────
-            // Upscale the half-width frame to fill the whole terminal.
-            let full =
-                imageops::resize(frame, full_w, height, imageops::FilterType::Nearest);
+            // Crop to fill the whole terminal.
+            let full = crop_center(frame, full_w, height);
             ascii_buf.clear();
+            let w = full.width();
+            let h = full.height();
             if color {
-                frame_to_color_ascii(&full, full_w, height, &mut ascii_buf);
+                frame_to_color_ascii(&full, w, h, &mut ascii_buf);
             } else {
-                frame_to_ascii(&full, full_w, height, &mut ascii_buf);
+                frame_to_ascii(&full, w, h, &mut ascii_buf);
             }
             render_panel(&mut stdout, ascii_buf.as_bytes(), 1, full_w, height);
         }

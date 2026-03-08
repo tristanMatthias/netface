@@ -1,11 +1,15 @@
 // UDP packet format:
-//   [0]    type    : u8  ('V' = video, 'A' = audio)
+//   [0]    type    : u8  ('V' = video, 'A' = audio, 'C' = config)
 //   [1..5] seq     : u32 LE
 //   [5..9] len     : u32 LE (payload length)
 //   [9..]  payload : [u8]
+//
+// Config payload:
+//   [0..4] width   : u32 LE (desired display width)
+//   [4..8] height  : u32 LE (desired display height)
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -17,6 +21,7 @@ const MAX_UDP: usize = 65507;
 
 pub const PKT_VIDEO: u8 = b'V';
 pub const PKT_AUDIO: u8 = b'A';
+pub const PKT_CONFIG: u8 = b'C';
 
 fn encode(buf: &mut Vec<u8>, pkt_type: u8, seq: u32, payload: &[u8]) {
     buf.clear();
@@ -31,12 +36,27 @@ pub fn send_loop(
     peer: SocketAddr,
     vid_rx: Receiver<Vec<u8>>,
     aud_rx: Receiver<Vec<u8>>,
+    local_w: u32,
+    local_h: u32,
 ) {
     let mut seq: u32 = 0;
     let mut buf = Vec::with_capacity(MAX_UDP);
+    let mut config_counter: u32 = 0;
 
     loop {
         let mut active = false;
+
+        // Send config every ~60 iterations (~1/sec at 60fps)
+        config_counter += 1;
+        if config_counter >= 60 {
+            config_counter = 0;
+            let mut cfg = Vec::with_capacity(8);
+            cfg.extend_from_slice(&local_w.to_le_bytes());
+            cfg.extend_from_slice(&local_h.to_le_bytes());
+            encode(&mut buf, PKT_CONFIG, seq, &cfg);
+            let _ = sock.send_to(&buf, peer);
+            seq = seq.wrapping_add(1);
+        }
 
         // One video frame per loop iteration
         if let Ok(payload) = vid_rx.try_recv() {
@@ -72,6 +92,8 @@ pub fn recv_loop(
     vid_tx: Sender<Vec<u8>>,
     aud_tx: Sender<Vec<u8>>,
     peer_connected: Arc<AtomicBool>,
+    peer_w: Arc<AtomicU32>,
+    peer_h: Arc<AtomicU32>,
 ) {
     let mut buf = vec![0u8; MAX_UDP];
     loop {
@@ -94,6 +116,15 @@ pub fn recv_loop(
                     }
                     PKT_AUDIO => {
                         let _ = aud_tx.try_send(payload);
+                    }
+                    PKT_CONFIG => {
+                        if payload.len() >= 8 {
+                            let w = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                            let h = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                            peer_w.store(w, Ordering::Relaxed);
+                            peer_h.store(h, Ordering::Relaxed);
+                            peer_connected.store(true, Ordering::Relaxed);
+                        }
                     }
                     _ => {}
                 }

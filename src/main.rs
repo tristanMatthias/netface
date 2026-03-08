@@ -20,7 +20,7 @@
 use std::io::Write;
 use std::net::UdpSocket;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
 use std::thread;
@@ -106,6 +106,9 @@ fn main() {
     // Flipped to `true` by the receive thread the moment the first video
     // packet arrives; read by the compositor to trigger the split transition.
     let peer_connected = Arc::new(AtomicBool::new(false));
+    // Peer's requested display dimensions (updated by recv_loop from config packets).
+    let peer_w = Arc::new(AtomicU32::new(half_w));
+    let peer_h = Arc::new(AtomicU32::new(height));
 
     // ── Channels ──────────────────────────────────────────────────────────
     let (display_tx, display_rx) = bounded::<video::RawFrame>(2); // capture → compositor
@@ -119,34 +122,40 @@ fn main() {
     {
         let sock = recv_sock.clone();
         let pc = peer_connected.clone();
-        thread::spawn(move || net::recv_loop(sock, remote_vid_tx, remote_aud_tx, pc));
+        let pw = peer_w.clone();
+        let ph = peer_h.clone();
+        thread::spawn(move || net::recv_loop(sock, remote_vid_tx, remote_aud_tx, pc, pw, ph));
     }
 
     // ── Network send ──────────────────────────────────────────────────────
     {
         let sock = send_sock.clone();
-        thread::spawn(move || net::send_loop(sock, peer_addr, vid_rx, local_aud_rx));
+        thread::spawn(move || net::send_loop(sock, peer_addr, vid_rx, local_aud_rx, half_w, height));
     }
 
     // ── Camera capture ────────────────────────────────────────────────────
+    // Capture at native resolution (no resize).
     {
-        let (cam, w, h, fps) = (args.camera, half_w, height, args.fps);
-        thread::spawn(move || video::capture_thread(cam, w, h, fps, display_tx, net_raw_tx));
+        let (cam, fps) = (args.camera, args.fps);
+        thread::spawn(move || video::capture_thread(cam, fps, display_tx, net_raw_tx));
     }
 
     // ── Network encoder (RawFrame → ASCII → lz4 → UDP) ───────────────────
+    // Uses peer's requested dimensions for cropping and ASCII conversion.
     {
-        let (w, h, color) = (half_w, height, args.color);
-        thread::spawn(move || video::net_encode_thread(net_raw_rx, vid_tx, w, h, color));
+        let color = args.color;
+        let pw = peer_w.clone();
+        let ph = peer_h.clone();
+        thread::spawn(move || video::net_encode_thread(net_raw_rx, vid_tx, pw, ph, color));
     }
 
     // ── Compositor ────────────────────────────────────────────────────────
     // Solo until peer_connected flips; then snaps to 50/50 split.
     {
         let pc = peer_connected.clone();
-        let (w, h, color) = (half_w, height, args.color);
+        let color = args.color;
         thread::spawn(move || {
-            video::compositor_thread(display_rx, remote_vid_rx, pc, w, h, color)
+            video::compositor_thread(display_rx, remote_vid_rx, pc, half_w, height, color)
         });
     }
 
