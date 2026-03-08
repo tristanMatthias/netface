@@ -11,25 +11,11 @@ use nokhwa::Camera;
 use ort::session::Session;
 
 use crate::config::Config;
+use crate::theme::ThemeRenderer;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// ASCII character ramp from dark to light.
-const CHARS: &[u8] = b" `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
-
-/// Pre-computed lookup table: luminance byte (0-255) -> character index.
-const LUM_TO_CHAR: [u8; 256] = {
-    let mut table = [0u8; 256];
-    let n = (CHARS.len() - 1) as f64;
-    let mut i = 0;
-    while i < 256 {
-        table[i] = ((i as f64 / 255.0) * n) as u8;
-        i += 1;
-    }
-    table
-};
 
 /// MediaPipe model input size.
 const MODEL_SIZE: u32 = 256;
@@ -515,6 +501,7 @@ pub fn net_encode_thread(
     bg_session: Option<Arc<Mutex<Session>>>,
     bg_color: [u8; 3],
     cfg: VideoConfig,
+    renderer: Arc<ThemeRenderer>,
 ) {
     let mut ascii = Vec::with_capacity(128 * 1024);
     let mut buffers = ProcessingBuffers::new();
@@ -537,9 +524,9 @@ pub fn net_encode_thread(
 
         ascii.clear();
         if color {
-            frame_to_color_ascii_fast(&processed, &mut ascii);
+            renderer.render_frame(processed.as_raw(), processed.width() as usize, processed.height() as usize, &mut ascii);
         } else {
-            frame_to_ascii_fast(&processed, &mut ascii);
+            renderer.render_frame_mono(processed.as_raw(), processed.width() as usize, processed.height() as usize, &mut ascii);
         }
 
         let compressed = lz4_flex::compress_prepend_size(&ascii);
@@ -562,6 +549,7 @@ pub fn compositor_thread(
     bg_session: Option<Arc<Mutex<Session>>>,
     bg_color: [u8; 3],
     cfg: VideoConfig,
+    renderer: Arc<ThemeRenderer>,
 ) {
     use std::io::Write;
 
@@ -617,9 +605,9 @@ pub fn compositor_thread(
 
             ascii_buf.clear();
             if color {
-                frame_to_color_ascii_fast(&processed, &mut ascii_buf);
+                renderer.render_frame(processed.as_raw(), processed.width() as usize, processed.height() as usize, &mut ascii_buf);
             } else {
-                frame_to_ascii_fast(&processed, &mut ascii_buf);
+                renderer.render_frame_mono(processed.as_raw(), processed.width() as usize, processed.height() as usize, &mut ascii_buf);
             }
             render_panel(&mut stdout, &ascii_buf, 1, height);
 
@@ -635,9 +623,9 @@ pub fn compositor_thread(
 
             ascii_buf.clear();
             if color {
-                frame_to_color_ascii_fast(&processed, &mut ascii_buf);
+                renderer.render_frame(processed.as_raw(), processed.width() as usize, processed.height() as usize, &mut ascii_buf);
             } else {
-                frame_to_ascii_fast(&processed, &mut ascii_buf);
+                renderer.render_frame_mono(processed.as_raw(), processed.width() as usize, processed.height() as usize, &mut ascii_buf);
             }
             render_panel(&mut stdout, &ascii_buf, 1, height);
         }
@@ -677,78 +665,3 @@ fn draw_separator(out: &mut impl std::io::Write, height: u32, col: u16) {
     let _ = out.flush();
 }
 
-// ---------------------------------------------------------------------------
-// ASCII conversion (optimized)
-// ---------------------------------------------------------------------------
-
-/// Fast monochrome ASCII conversion using raw buffer access.
-#[inline]
-fn frame_to_ascii_fast(img: &RawFrame, out: &mut Vec<u8>) {
-    let w = img.width() as usize;
-    let h = img.height() as usize;
-    let src = img.as_raw();
-
-    out.reserve(w * h + h);
-
-    for y in 0..h {
-        let row = y * w * 3;
-        for x in 0..w {
-            let i = row + x * 3;
-            // Fast luminance: approximate 0.299R + 0.587G + 0.114B
-            // Using shifts: (R*77 + G*150 + B*29) >> 8
-            let lum = ((src[i] as u32 * 77 + src[i + 1] as u32 * 150 + src[i + 2] as u32 * 29) >> 8) as u8;
-            out.push(CHARS[LUM_TO_CHAR[lum as usize] as usize]);
-        }
-        out.push(b'\n');
-    }
-}
-
-/// Fast color ASCII conversion using raw buffer access.
-#[inline]
-fn frame_to_color_ascii_fast(img: &RawFrame, out: &mut Vec<u8>) {
-    let w = img.width() as usize;
-    let h = img.height() as usize;
-    let src = img.as_raw();
-
-    // Estimate: ~20 bytes per pixel for color escape + char
-    out.reserve(w * h * 20 + h * 5);
-
-    for y in 0..h {
-        let row = y * w * 3;
-        for x in 0..w {
-            let i = row + x * 3;
-            let r = src[i];
-            let g = src[i + 1];
-            let b = src[i + 2];
-
-            // Fast luminance
-            let lum = ((r as u32 * 77 + g as u32 * 150 + b as u32 * 29) >> 8) as u8;
-
-            // Build escape sequence manually for speed
-            out.extend_from_slice(b"\x1b[38;2;");
-            push_dec_fast(out, r);
-            out.push(b';');
-            push_dec_fast(out, g);
-            out.push(b';');
-            push_dec_fast(out, b);
-            out.push(b'm');
-            out.push(CHARS[LUM_TO_CHAR[lum as usize] as usize]);
-        }
-        out.extend_from_slice(b"\x1b[0m\n");
-    }
-}
-
-/// Fast decimal push for u8.
-#[inline(always)]
-fn push_dec_fast(out: &mut Vec<u8>, v: u8) {
-    if v >= 100 {
-        out.push(b'0' + v / 100);
-        out.push(b'0' + (v / 10) % 10);
-        out.push(b'0' + v % 10);
-    } else if v >= 10 {
-        out.push(b'0' + v / 10);
-        out.push(b'0' + v % 10);
-    } else {
-        out.push(b'0' + v);
-    }
-}

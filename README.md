@@ -34,7 +34,57 @@ netface --peer alice.ip:4444
 | `--camera` | `0` | Webcam device index |
 | `--fps` | `15` | Capture frame rate |
 | `-C, --color` | off | ANSI truecolor output |
+| `-t, --theme` | `detailed` | Character theme |
+| `-m, --color-mode` | `matrix` | Color mode (auto-enables color) |
+| `-b, --bg-removal` | off | AI background removal |
 | `--no-audio` | off | Disable microphone / speakers |
+
+### Themes
+
+**Character themes** control which characters represent brightness levels:
+
+| Theme | Characters | Description |
+|-------|------------|-------------|
+| `detailed` | 92 ASCII chars | High detail (default) |
+| `classic` | ` .:-=+*#%@` | Simple 10-char ramp |
+| `blocks` | `░▒▓█` | Unicode block elements |
+| `dots` | Braille dots | Braille patterns |
+| `emoji-moon` | `🌑🌒🌓🌔🌕` | Moon phases |
+| `emoji-hearts` | `🖤💜💙💚💛🧡❤️` | Heart gradient |
+| `emoji-fire` | `⬛🟫🟠🟡⬜` | Fire/heat squares |
+
+**Color modes** control how colors are applied:
+
+| Mode | Description |
+|------|-------------|
+| `matrix` | Black to green gradient (default) |
+| `original` | Use actual pixel colors |
+| `mono-green` | Classic green terminal |
+| `mono-amber` | Retro amber terminal |
+| `cyberpunk` | Magenta to cyan gradient |
+| `sunset` | Purple to orange gradient |
+| `ice` | Dark blue to white gradient |
+| `sepia` | Warm brownish tint |
+| `cool` | Cool bluish tint |
+
+Example combinations:
+```sh
+netface --peer host:4444 --theme blocks --color-mode original
+netface --peer host:4444 --theme emoji-moon --color-mode mono-white
+netface --peer host:4444 --color-mode cyberpunk
+```
+
+### Configuration
+
+Settings persist in `~/.config/netface/config.toml`. CLI flags override config values.
+
+```sh
+# Create default config
+netface --init-config
+
+# Print example config
+netface --example-config
+```
 
 ## Build
 

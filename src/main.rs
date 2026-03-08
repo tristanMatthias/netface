@@ -28,9 +28,11 @@ use crossbeam_channel::bounded;
 mod audio;
 mod config;
 mod net;
+mod theme;
 mod video;
 
 use config::Config;
+use theme::{build_theme, ThemeRenderer};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,6 +71,14 @@ struct Args {
     /// Background color when removal is enabled (hex RGB, e.g., "000000" for black)
     #[arg(long)]
     bg_color: Option<String>,
+
+    /// Character theme (classic, blocks, dots, emoji-faces, emoji-moon, etc.)
+    #[arg(short = 't', long)]
+    theme: Option<String>,
+
+    /// Color mode (original, mono-green, matrix, cyberpunk, sunset, etc.)
+    #[arg(short = 'm', long)]
+    color_mode: Option<String>,
 
     /// Create default config file at ~/.config/netface/config.toml
     #[arg(long)]
@@ -135,9 +145,28 @@ fn main() {
     if let Some(bg_color) = args.bg_color {
         cfg.bg_color = bg_color;
     }
+    if let Some(theme) = args.theme {
+        cfg.theme = theme;
+    }
+    if let Some(color_mode) = args.color_mode {
+        cfg.color_mode = color_mode;
+    }
+
+    // Auto-enable color output when using a non-original color mode
+    if cfg.color_mode != "original" {
+        cfg.color = true;
+    }
 
     // Parse derived values
     let bg_color = cfg.bg_color_rgb();
+
+    // Build theme and renderer
+    let theme = if let Some(ref custom) = cfg.custom_theme {
+        custom.to_theme().unwrap_or_else(|| build_theme(&cfg.theme, &cfg.color_mode))
+    } else {
+        build_theme(&cfg.theme, &cfg.color_mode)
+    };
+    let renderer = Arc::new(ThemeRenderer::new(&theme));
 
     // ── Terminal dimensions ───────────────────────────────────────────────
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -230,8 +259,9 @@ fn main() {
         let ph = peer_h.clone();
         let bgs = bg_session.clone();
         let video_cfg = video::VideoConfig::from(&cfg);
+        let rend = renderer.clone();
         thread::spawn(move || {
-            video::net_encode_thread(net_raw_rx, vid_tx, pw, ph, color, bgs, bg_color, video_cfg)
+            video::net_encode_thread(net_raw_rx, vid_tx, pw, ph, color, bgs, bg_color, video_cfg, rend)
         });
     }
 
@@ -241,6 +271,7 @@ fn main() {
         let color = cfg.color;
         let bgs = bg_session.clone();
         let video_cfg = video::VideoConfig::from(&cfg);
+        let rend = renderer.clone();
         thread::spawn(move || {
             video::compositor_thread(
                 display_rx,
@@ -252,6 +283,7 @@ fn main() {
                 bgs,
                 bg_color,
                 video_cfg,
+                rend,
             )
         });
     }
