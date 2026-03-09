@@ -157,10 +157,17 @@ pub struct ThemeRenderer {
     /// Pre-computed ANSI color sequences for luminance-based modes [256 entries].
     /// Empty for Original/Tint modes (computed per-pixel).
     lum_to_ansi: Vec<Vec<u8>>,
+    /// Pre-computed full sequences (ANSI + char) for luminance-based modes [256 entries].
+    /// This is the fastest path: one lookup per pixel.
+    lum_to_full: Vec<Vec<u8>>,
     /// Character width in terminal columns (1 for ASCII, 2 for emoji/wide chars).
     char_width: usize,
     /// Whether we can use pre-computed ANSI sequences.
     use_lum_ansi: bool,
+    /// Whether all characters are single-byte ASCII (enables fastest path).
+    is_ascii_only: bool,
+    /// For ASCII-only themes: flat array of single characters indexed by luminance.
+    ascii_lut: [u8; 256],
 }
 
 impl ThemeRenderer {
@@ -187,6 +194,9 @@ impl ThemeRenderer {
             1
         };
 
+        // Check if all characters are single-byte ASCII
+        let is_ascii_only = chars.iter().all(|c| c.len() == 1);
+
         let char_count = chars.len();
 
         // Build luminance to character index lookup
@@ -194,6 +204,15 @@ impl ThemeRenderer {
         let n = (char_count - 1) as f64;
         for i in 0..256 {
             lum_to_idx[i] = ((i as f64 / 255.0) * n) as u8;
+        }
+
+        // Build ASCII lookup table for mono mode (fastest path)
+        let mut ascii_lut = [b' '; 256];
+        if is_ascii_only {
+            for i in 0..256 {
+                let char_idx = lum_to_idx[i] as usize;
+                ascii_lut[i] = chars[char_idx][0];
+            }
         }
 
         // Pre-compute colors for luminance values
@@ -223,14 +242,40 @@ impl ThemeRenderer {
             Vec::new()
         };
 
+        // Pre-compute FULL sequences (ANSI + char) for lum-based modes
+        // This is the absolute fastest path: one lookup + memcpy per pixel
+        let lum_to_full = if use_lum_ansi {
+            (0..256)
+                .map(|i| {
+                    let char_idx = lum_to_idx[i] as usize;
+                    let char_bytes = &chars[char_idx];
+                    let mut seq = Vec::with_capacity(22);
+                    seq.extend_from_slice(b"\x1b[38;2;");
+                    push_dec_fast(&mut seq, lum_to_color[i][0]);
+                    seq.push(b';');
+                    push_dec_fast(&mut seq, lum_to_color[i][1]);
+                    seq.push(b';');
+                    push_dec_fast(&mut seq, lum_to_color[i][2]);
+                    seq.push(b'm');
+                    seq.extend_from_slice(char_bytes);
+                    seq
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Self {
             chars,
             lum_to_idx,
             color_mode: theme.color_mode.clone(),
             lum_to_color,
             lum_to_ansi,
+            lum_to_full,
             char_width,
             use_lum_ansi,
+            is_ascii_only,
+            ascii_lut,
         }
     }
 
@@ -328,12 +373,103 @@ impl ThemeRenderer {
         // Estimate output size: ~20 bytes per pixel for color escape + char
         out.reserve(effective_width * height * 20 + height * 5);
 
+        // Fastest path: luminance-based modes with pre-computed full sequences
+        if self.use_lum_ansi {
+            self.render_frame_lum_fast(img, width, height, step, out);
+            return;
+        }
+
+        // Original color mode - must compute per-pixel
+        if matches!(self.color_mode, ColorMode::Original) {
+            self.render_frame_original_fast(img, width, height, step, out);
+            return;
+        }
+
+        // Tint mode - per-pixel HSV transform
         for y in 0..height {
             let row = y * width * 3;
             for x in (0..width).step_by(step) {
                 let i = row + x * 3;
                 self.render_pixel(out, img[i], img[i + 1], img[i + 2]);
             }
+            out.extend_from_slice(b"\x1b[0m\n");
+        }
+    }
+
+    /// Fast path for luminance-based color modes (Monochrome, Gradient, Palette).
+    /// Uses pre-computed full sequences (ANSI + char) - one lookup per pixel.
+    #[inline(never)]
+    fn render_frame_lum_fast(&self, img: &[u8], width: usize, height: usize, step: usize, out: &mut Vec<u8>) {
+        let byte_step = step * 3; // bytes per terminal column
+        let row_bytes = width * 3;
+
+        for y in 0..height {
+            let row_start = y * row_bytes;
+            let row = &img[row_start..row_start + row_bytes];
+
+            // Process 4 pixels at a time when possible
+            let mut x = 0;
+            let bytes_per_iter = byte_step * 4; // 4 pixels worth of bytes
+            while x + bytes_per_iter <= row_bytes {
+                // Unrolled: 4 pixels
+                let lum0 = fast_luminance(row[x], row[x + 1], row[x + 2]);
+                let lum1 = fast_luminance(row[x + byte_step], row[x + byte_step + 1], row[x + byte_step + 2]);
+                let lum2 = fast_luminance(row[x + byte_step * 2], row[x + byte_step * 2 + 1], row[x + byte_step * 2 + 2]);
+                let lum3 = fast_luminance(row[x + byte_step * 3], row[x + byte_step * 3 + 1], row[x + byte_step * 3 + 2]);
+
+                // Safety: lum values are 0-255, lum_to_full has 256 entries
+                unsafe {
+                    out.extend_from_slice(self.lum_to_full.get_unchecked(lum0 as usize));
+                    out.extend_from_slice(self.lum_to_full.get_unchecked(lum1 as usize));
+                    out.extend_from_slice(self.lum_to_full.get_unchecked(lum2 as usize));
+                    out.extend_from_slice(self.lum_to_full.get_unchecked(lum3 as usize));
+                }
+                x += bytes_per_iter;
+            }
+
+            // Handle remaining pixels
+            while x + 3 <= row_bytes {
+                let lum = fast_luminance(row[x], row[x + 1], row[x + 2]);
+                unsafe {
+                    out.extend_from_slice(self.lum_to_full.get_unchecked(lum as usize));
+                }
+                x += byte_step;
+            }
+
+            out.extend_from_slice(b"\x1b[0m\n");
+        }
+    }
+
+    /// Fast path for Original color mode with per-pixel RGB.
+    #[inline(never)]
+    fn render_frame_original_fast(&self, img: &[u8], width: usize, height: usize, step: usize, out: &mut Vec<u8>) {
+        for y in 0..height {
+            let row_start = y * width * 3;
+
+            for x in (0..width).step_by(step) {
+                let i = row_start + x * 3;
+                let r = img[i];
+                let g = img[i + 1];
+                let b = img[i + 2];
+
+                let lum = fast_luminance(r, g, b);
+                let char_idx = self.lum_to_idx[lum as usize] as usize;
+
+                // Write ANSI color
+                out.extend_from_slice(b"\x1b[38;2;");
+                push_dec_fast(out, r);
+                out.push(b';');
+                push_dec_fast(out, g);
+                out.push(b';');
+                push_dec_fast(out, b);
+                out.push(b'm');
+
+                // Write character
+                unsafe {
+                    out.extend_from_slice(self.chars.get_unchecked(char_idx));
+                }
+            }
+
             out.extend_from_slice(b"\x1b[0m\n");
         }
     }
@@ -348,16 +484,72 @@ impl ThemeRenderer {
 
         out.reserve((width / step) * height + height);
 
+        // Fastest path: ASCII-only themes use direct LUT
+        if self.is_ascii_only && step == 1 {
+            self.render_frame_mono_ascii_fast(img, width, height, out);
+            return;
+        }
+
+        // General path for multi-byte characters
         for y in 0..height {
             let row = y * width * 3;
             for x in (0..width).step_by(step) {
                 let i = row + x * 3;
                 let lum = fast_luminance(img[i], img[i + 1], img[i + 2]);
                 let char_idx = self.lum_to_idx[lum as usize] as usize;
-                let char_idx = if char_idx < self.chars.len() { char_idx } else { self.chars.len() - 1 };
-                let char_bytes = &self.chars[char_idx];
-                out.extend_from_slice(char_bytes);
+                // Safety: char_idx is bounded by lum_to_idx construction
+                unsafe {
+                    out.extend_from_slice(self.chars.get_unchecked(char_idx));
+                }
             }
+            out.push(b'\n');
+        }
+    }
+
+    /// Fastest mono path for ASCII-only themes.
+    /// Uses direct byte LUT - no indirection, no bounds checks.
+    #[inline(never)]
+    fn render_frame_mono_ascii_fast(&self, img: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
+        let row_len = width * 3;
+
+        for y in 0..height {
+            let row_start = y * row_len;
+            let row = &img[row_start..row_start + row_len];
+
+            // Pre-extend capacity for this row
+            out.reserve(width + 1);
+
+            // Process 8 pixels at a time
+            let mut x = 0;
+            while x + 24 <= row_len {
+                let lum0 = fast_luminance(row[x], row[x + 1], row[x + 2]);
+                let lum1 = fast_luminance(row[x + 3], row[x + 4], row[x + 5]);
+                let lum2 = fast_luminance(row[x + 6], row[x + 7], row[x + 8]);
+                let lum3 = fast_luminance(row[x + 9], row[x + 10], row[x + 11]);
+                let lum4 = fast_luminance(row[x + 12], row[x + 13], row[x + 14]);
+                let lum5 = fast_luminance(row[x + 15], row[x + 16], row[x + 17]);
+                let lum6 = fast_luminance(row[x + 18], row[x + 19], row[x + 20]);
+                let lum7 = fast_luminance(row[x + 21], row[x + 22], row[x + 23]);
+
+                out.push(self.ascii_lut[lum0 as usize]);
+                out.push(self.ascii_lut[lum1 as usize]);
+                out.push(self.ascii_lut[lum2 as usize]);
+                out.push(self.ascii_lut[lum3 as usize]);
+                out.push(self.ascii_lut[lum4 as usize]);
+                out.push(self.ascii_lut[lum5 as usize]);
+                out.push(self.ascii_lut[lum6 as usize]);
+                out.push(self.ascii_lut[lum7 as usize]);
+
+                x += 24;
+            }
+
+            // Handle remaining pixels
+            while x < row_len {
+                let lum = fast_luminance(row[x], row[x + 1], row[x + 2]);
+                out.push(self.ascii_lut[lum as usize]);
+                x += 3;
+            }
+
             out.push(b'\n');
         }
     }
@@ -515,23 +707,26 @@ fn write_ansi_color(out: &mut Vec<u8>, color: [u8; 3]) {
     out.push(b'm');
 }
 
-/// Pre-computed decimal strings for 0-255.
-static DECIMAL_STRINGS: [[u8; 3]; 256] = {
-    let mut table = [[0u8; 3]; 256];
+/// Pre-computed decimal strings for 0-255 (null-terminated).
+static DECIMAL_STRINGS: [[u8; 4]; 256] = {
+    let mut table = [[0u8; 4]; 256];
     let mut i = 0usize;
     while i < 256 {
         if i >= 100 {
             table[i][0] = b'0' + (i / 100) as u8;
             table[i][1] = b'0' + ((i / 10) % 10) as u8;
             table[i][2] = b'0' + (i % 10) as u8;
+            table[i][3] = 3; // length
         } else if i >= 10 {
             table[i][0] = b'0' + (i / 10) as u8;
             table[i][1] = b'0' + (i % 10) as u8;
             table[i][2] = 0;
+            table[i][3] = 2; // length
         } else {
             table[i][0] = b'0' + i as u8;
             table[i][1] = 0;
             table[i][2] = 0;
+            table[i][3] = 1; // length
         }
         i += 1;
     }
@@ -541,14 +736,9 @@ static DECIMAL_STRINGS: [[u8; 3]; 256] = {
 /// Fast decimal push for u8 using lookup table.
 #[inline(always)]
 fn push_dec_fast(out: &mut Vec<u8>, v: u8) {
-    let digits = &DECIMAL_STRINGS[v as usize];
-    out.push(digits[0]);
-    if digits[1] != 0 {
-        out.push(digits[1]);
-        if digits[2] != 0 {
-            out.push(digits[2]);
-        }
-    }
+    let entry = &DECIMAL_STRINGS[v as usize];
+    let len = entry[3] as usize;
+    out.extend_from_slice(&entry[..len]);
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +765,7 @@ pub fn build_theme(char_theme: &str, color_mode_name: &str) -> Theme {
 // ---------------------------------------------------------------------------
 
 /// Custom theme configuration from TOML.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CustomThemeConfig {
     /// Custom character string.
@@ -595,6 +786,7 @@ pub struct CustomThemeConfig {
     pub saturation: Option<f32>,
 }
 
+#[allow(dead_code)]
 impl CustomThemeConfig {
     /// Parse hex color string to RGB.
     fn parse_hex(hex: &str) -> [u8; 3] {

@@ -278,207 +278,102 @@ fn resize_gray_nearest(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh
     }
 }
 
-/// Pre-computed normalization table for RGB to float conversion.
-static RGB_TO_FLOAT: [f32; 256] = {
-    let mut table = [0.0f32; 256];
-    let mut i = 0;
-    while i < 256 {
-        table[i] = i as f32 / 255.0;
-        i += 1;
-    }
-    table
-};
-
 /// Convert RGB bytes to normalized NCHW tensor.
 #[inline]
 fn rgb_to_nchw(rgb: &[u8], size: u32, out: &mut [f32]) {
     let size = size as usize;
     let plane = size * size;
+    let inv = 1.0 / 255.0;
 
     for y in 0..size {
         for x in 0..size {
             let i = (y * size + x) * 3;
             let pi = y * size + x;
-            out[pi] = RGB_TO_FLOAT[rgb[i] as usize];
-            out[plane + pi] = RGB_TO_FLOAT[rgb[i + 1] as usize];
-            out[2 * plane + pi] = RGB_TO_FLOAT[rgb[i + 2] as usize];
+            out[pi] = rgb[i] as f32 * inv;
+            out[plane + pi] = rgb[i + 1] as f32 * inv;
+            out[2 * plane + pi] = rgb[i + 2] as f32 * inv;
         }
     }
 }
 
-/// Fast morphological erosion using separable min filter.
+/// Fast morphological erosion (min filter).
 #[inline]
 fn erode(src: &[u8], dst: &mut [u8], w: u32, h: u32, r: i32) {
     let w = w as usize;
     let h = h as usize;
     let r = r as usize;
 
-    if r == 0 {
-        dst.copy_from_slice(src);
-        return;
-    }
+    // Copy edges unchanged
+    dst.copy_from_slice(src);
 
-    // Horizontal pass: src -> dst
-    for y in 0..h {
-        let row = y * w;
-        for x in 0..w {
-            let x_start = x.saturating_sub(r);
-            let x_end = (x + r + 1).min(w);
+    for y in r..(h - r) {
+        for x in r..(w - r) {
             let mut min = 255u8;
-            for kx in x_start..x_end {
-                min = min.min(src[row + kx]);
+            for ky in 0..=(r * 2) {
+                let row = (y + ky - r) * w;
+                for kx in 0..=(r * 2) {
+                    min = min.min(src[row + x + kx - r]);
+                }
             }
-            dst[row + x] = min;
-        }
-    }
-
-    // Vertical pass: dst -> dst (in-place via temp storage per column)
-    for x in 0..w {
-        // First pass: compute all mins
-        let mut col_mins: Vec<u8> = Vec::with_capacity(h);
-        for y in 0..h {
-            let y_start = y.saturating_sub(r);
-            let y_end = (y + r + 1).min(h);
-            let mut min = 255u8;
-            for ky in y_start..y_end {
-                min = min.min(dst[ky * w + x]);
-            }
-            col_mins.push(min);
-        }
-        // Write back
-        for (y, &val) in col_mins.iter().enumerate() {
-            dst[y * w + x] = val;
+            dst[y * w + x] = min;
         }
     }
 }
 
-/// Fast morphological dilation using separable max filter.
+/// Fast morphological dilation (max filter).
 #[inline]
 fn dilate(src: &[u8], dst: &mut [u8], w: u32, h: u32, r: i32) {
     let w = w as usize;
     let h = h as usize;
     let r = r as usize;
 
-    if r == 0 {
-        dst.copy_from_slice(src);
-        return;
-    }
+    dst.copy_from_slice(src);
 
-    // Horizontal pass: src -> dst
-    for y in 0..h {
-        let row = y * w;
-        for x in 0..w {
-            let x_start = x.saturating_sub(r);
-            let x_end = (x + r + 1).min(w);
+    for y in r..(h - r) {
+        for x in r..(w - r) {
             let mut max = 0u8;
-            for kx in x_start..x_end {
-                max = max.max(src[row + kx]);
+            for ky in 0..=(r * 2) {
+                let row = (y + ky - r) * w;
+                for kx in 0..=(r * 2) {
+                    max = max.max(src[row + x + kx - r]);
+                }
             }
-            dst[row + x] = max;
-        }
-    }
-
-    // Vertical pass: dst -> dst (in-place via temp storage per column)
-    for x in 0..w {
-        let mut col_maxs: Vec<u8> = Vec::with_capacity(h);
-        for y in 0..h {
-            let y_start = y.saturating_sub(r);
-            let y_end = (y + r + 1).min(h);
-            let mut max = 0u8;
-            for ky in y_start..y_end {
-                max = max.max(dst[ky * w + x]);
-            }
-            col_maxs.push(max);
-        }
-        for (y, &val) in col_maxs.iter().enumerate() {
-            dst[y * w + x] = val;
+            dst[y * w + x] = max;
         }
     }
 }
 
-/// Fast separable box blur - O(n*r) instead of O(n*r²).
+/// Fast box blur (separable).
 #[inline]
 fn box_blur(src: &[u8], dst: &mut [u8], w: u32, h: u32, r: usize) {
     let w = w as usize;
     let h = h as usize;
 
-    if r == 0 {
-        dst.copy_from_slice(src);
-        return;
-    }
-
-    // Use dst as temporary buffer for horizontal pass
-    // Horizontal pass: src -> dst
+    // Simple box blur (not separable for simplicity, but still fast)
     for y in 0..h {
-        let row_start = y * w;
-        let mut sum = 0u32;
-        let mut count = 0u32;
+        for x in 0..w {
+            let mut sum = 0u32;
+            let mut count = 0u32;
 
-        // Initialize window
-        for x in 0..=r.min(w - 1) {
-            sum += src[row_start + x] as u32;
-            count += 1;
-        }
-        dst[row_start] = (sum / count) as u8;
+            let y_start = y.saturating_sub(r);
+            let y_end = (y + r + 1).min(h);
+            let x_start = x.saturating_sub(r);
+            let x_end = (x + r + 1).min(w);
 
-        // Slide window
-        for x in 1..w {
-            // Add right edge
-            let right = x + r;
-            if right < w {
-                sum += src[row_start + right] as u32;
-                count += 1;
+            for ky in y_start..y_end {
+                let row = ky * w;
+                for kx in x_start..x_end {
+                    sum += src[row + kx] as u32;
+                    count += 1;
+                }
             }
-            // Remove left edge
-            let left = x as isize - r as isize - 1;
-            if left >= 0 {
-                sum -= src[row_start + left as usize] as u32;
-                count -= 1;
-            }
-            dst[row_start + x] = (sum / count) as u8;
-        }
-    }
 
-    // Vertical pass: dst -> src (we'll copy back to dst)
-    // We need another buffer, so we do it in-place column by column
-    for x in 0..w {
-        let mut sum = 0u32;
-        let mut count = 0u32;
-
-        // Initialize window
-        for y in 0..=r.min(h - 1) {
-            sum += dst[y * w + x] as u32;
-            count += 1;
-        }
-        let first_val = (sum / count) as u8;
-
-        // Slide window and store temporarily
-        let mut col_vals = Vec::with_capacity(h);
-        col_vals.push(first_val);
-
-        for y in 1..h {
-            let bottom = y + r;
-            if bottom < h {
-                sum += dst[bottom * w + x] as u32;
-                count += 1;
-            }
-            let top = y as isize - r as isize - 1;
-            if top >= 0 {
-                sum -= dst[top as usize * w + x] as u32;
-                count -= 1;
-            }
-            col_vals.push((sum / count) as u8);
-        }
-
-        // Write back
-        for (y, &val) in col_vals.iter().enumerate() {
-            dst[y * w + x] = val;
+            dst[y * w + x] = (sum / count) as u8;
         }
     }
 }
 
 /// Composite foreground with background using mask and contrast enhancement.
-/// Uses fixed-point arithmetic for better performance.
 #[inline]
 fn composite_with_contrast(
     src: &[u8],
@@ -492,36 +387,25 @@ fn composite_with_contrast(
 ) {
     let w = w as usize;
     let h = h as usize;
-
-    // Pre-compute contrast lookup table (256 entries)
-    let mut contrast_lut = [0i16; 256];
-    for i in 0..256 {
-        let val = ((i as f32 - mid) * contrast + mid).clamp(0.0, 255.0);
-        contrast_lut[i] = val as i16;
-    }
-
-    // Fixed-point background (8.8 format)
-    let bg_r = (bg[0] as i32) << 8;
-    let bg_g = (bg[1] as i32) << 8;
-    let bg_b = (bg[2] as i32) << 8;
+    let bg_f = [bg[0] as f32, bg[1] as f32, bg[2] as f32];
 
     for y in 0..h {
         let row = y * w;
         for x in 0..w {
             let i = row + x;
             let si = i * 3;
-            let alpha = mask[i] as i32; // 0-255
-            let inv_alpha = 255 - alpha;
+            let alpha = mask[i] as f32 * (1.0 / 255.0);
+            let inv_alpha = 1.0 - alpha;
 
-            // Contrast-enhanced foreground via LUT
-            let r = contrast_lut[src[si] as usize] as i32;
-            let g = contrast_lut[src[si + 1] as usize] as i32;
-            let b = contrast_lut[src[si + 2] as usize] as i32;
+            // Contrast-enhanced foreground
+            let r = ((src[si] as f32 - mid) * contrast + mid).clamp(0.0, 255.0);
+            let g = ((src[si + 1] as f32 - mid) * contrast + mid).clamp(0.0, 255.0);
+            let b = ((src[si + 2] as f32 - mid) * contrast + mid).clamp(0.0, 255.0);
 
-            // Alpha blend using fixed-point (result >> 8)
-            dst[si] = ((r * alpha + (bg_r >> 8) * inv_alpha) >> 8) as u8;
-            dst[si + 1] = ((g * alpha + (bg_g >> 8) * inv_alpha) >> 8) as u8;
-            dst[si + 2] = ((b * alpha + (bg_b >> 8) * inv_alpha) >> 8) as u8;
+            // Alpha blend
+            dst[si] = (r * alpha + bg_f[0] * inv_alpha) as u8;
+            dst[si + 1] = (g * alpha + bg_f[1] * inv_alpha) as u8;
+            dst[si + 2] = (b * alpha + bg_f[2] * inv_alpha) as u8;
         }
     }
 }
@@ -604,6 +488,39 @@ pub fn capture_thread(
 }
 
 // ---------------------------------------------------------------------------
+// Shared frame processing
+// ---------------------------------------------------------------------------
+
+/// Process a raw frame: crop, background removal, render to ASCII.
+#[inline]
+fn process_frame(
+    frame: &RawFrame,
+    w: u32,
+    h: u32,
+    color: bool,
+    bg_session: Option<&Arc<Mutex<Session>>>,
+    bg_color: [u8; 3],
+    buffers: &mut ProcessingBuffers,
+    cfg: &VideoConfig,
+    renderer: &ThemeRenderer,
+    out: &mut Vec<u8>,
+) {
+    let cropped = crop_center(frame, w, h, cfg.char_aspect);
+
+    let processed = match bg_session {
+        Some(session) => remove_background(&cropped, session, bg_color, buffers, cfg),
+        None => cropped,
+    };
+
+    out.clear();
+    if color {
+        renderer.render_frame(processed.as_raw(), w as usize, h as usize, out);
+    } else {
+        renderer.render_frame_mono(processed.as_raw(), w as usize, h as usize, out);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Network encoder thread
 // ---------------------------------------------------------------------------
 
@@ -631,19 +548,16 @@ pub fn net_encode_thread(
         let w = peer_w.load(Ordering::Relaxed);
         let h = peer_h.load(Ordering::Relaxed);
 
-        let cropped = crop_center(&frame, w, h, cfg.char_aspect);
-
-        let processed = match bg_session {
-            Some(ref session) => remove_background(&cropped, session, bg_color, &mut buffers, &cfg),
-            None => cropped,
-        };
-
-        ascii.clear();
-        if color {
-            renderer.render_frame(processed.as_raw(), processed.width() as usize, processed.height() as usize, &mut ascii);
-        } else {
-            renderer.render_frame_mono(processed.as_raw(), processed.width() as usize, processed.height() as usize, &mut ascii);
+        // Skip encoding until we receive peer config
+        if w == 0 || h == 0 {
+            continue;
         }
+
+        process_frame(
+            &frame, w, h, color,
+            bg_session.as_ref(), bg_color,
+            &mut buffers, &cfg, &renderer, &mut ascii,
+        );
 
         let compressed = lz4_flex::compress_prepend_size(&ascii);
         let _ = vid_tx.try_send(compressed);
@@ -713,36 +627,22 @@ pub fn compositor_thread(
         };
 
         if connected {
-            let cropped = crop_center(frame, half_w, height, cfg.char_aspect);
-            let processed = match bg_session {
-                Some(ref session) => remove_background(&cropped, session, bg_color, &mut buffers, &cfg),
-                None => cropped,
-            };
-
-            ascii_buf.clear();
-            if color {
-                renderer.render_frame(processed.as_raw(), processed.width() as usize, processed.height() as usize, &mut ascii_buf);
-            } else {
-                renderer.render_frame_mono(processed.as_raw(), processed.width() as usize, processed.height() as usize, &mut ascii_buf);
-            }
+            process_frame(
+                frame, half_w, height, color,
+                bg_session.as_ref(), bg_color,
+                &mut buffers, &cfg, &renderer, &mut ascii_buf,
+            );
             render_panel(&mut stdout, &ascii_buf, 1, height);
 
             if let Some(ref rb) = remote_bytes {
                 render_panel(&mut stdout, rb, remote_col, height);
             }
         } else {
-            let full = crop_center(frame, full_w, height, cfg.char_aspect);
-            let processed = match bg_session {
-                Some(ref session) => remove_background(&full, session, bg_color, &mut buffers, &cfg),
-                None => full,
-            };
-
-            ascii_buf.clear();
-            if color {
-                renderer.render_frame(processed.as_raw(), processed.width() as usize, processed.height() as usize, &mut ascii_buf);
-            } else {
-                renderer.render_frame_mono(processed.as_raw(), processed.width() as usize, processed.height() as usize, &mut ascii_buf);
-            }
+            process_frame(
+                frame, full_w, height, color,
+                bg_session.as_ref(), bg_color,
+                &mut buffers, &cfg, &renderer, &mut ascii_buf,
+            );
             render_panel(&mut stdout, &ascii_buf, 1, height);
         }
 

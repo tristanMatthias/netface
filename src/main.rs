@@ -32,7 +32,6 @@ mod theme;
 mod video;
 
 use config::Config;
-use theme::{build_theme, ThemeRenderer};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -49,36 +48,36 @@ struct Args {
     port: Option<u16>,
 
     /// Webcam device index (0 = default)
-    #[arg(short, long)]
+    #[arg(long)]
     camera: Option<usize>,
 
     /// Target capture FPS
     #[arg(short, long)]
     fps: Option<u64>,
 
-    /// ANSI truecolor output (richer image, bigger packets)
-    #[arg(short = 'C', long)]
-    color: bool,
+    /// Character theme (classic, detailed, blocks, dots, emoji-moon, etc.)
+    #[arg(short = 't', long)]
+    theme: Option<String>,
+
+    /// Color mode (original, mono-green, matrix, cyberpunk, sunset, etc.)
+    #[arg(short = 'c', long)]
+    color_mode: Option<String>,
+
+    /// List available themes and color modes
+    #[arg(long)]
+    list_themes: bool,
 
     /// Disable audio
     #[arg(long)]
     no_audio: bool,
 
-    /// Enable background removal (requires more CPU)
-    #[arg(short = 'b', long)]
-    bg_removal: bool,
+    /// Disable background removal
+    #[arg(long)]
+    no_bg_removal: bool,
 
     /// Background color when removal is enabled (hex RGB, e.g., "000000" for black)
     #[arg(long)]
     bg_color: Option<String>,
-
-    /// Character theme (classic, blocks, dots, emoji-faces, emoji-moon, etc.)
-    #[arg(short = 't', long)]
-    theme: Option<String>,
-
-    /// Color mode (original, mono-green, matrix, cyberpunk, sunset, etc.)
-    #[arg(short = 'm', long)]
-    color_mode: Option<String>,
 
     /// Create default config file at ~/.config/netface/config.toml
     #[arg(long)]
@@ -112,6 +111,19 @@ fn main() {
         return;
     }
 
+    if args.list_themes {
+        println!("Character themes:");
+        for name in theme::list_char_ramps() {
+            let chars = theme::get_char_ramp(name).unwrap_or("");
+            println!("  {:<15} {}", name, chars);
+        }
+        println!("\nColor modes:");
+        for name in theme::list_color_modes() {
+            println!("  {}", name);
+        }
+        return;
+    }
+
     // Require peer address for normal operation
     let peer_str = args.peer.unwrap_or_else(|| {
         eprintln!("Error: --peer is required");
@@ -133,14 +145,11 @@ fn main() {
     if let Some(fps) = args.fps {
         cfg.fps = fps;
     }
-    if args.color {
-        cfg.color = true;
-    }
     if args.no_audio {
         cfg.no_audio = true;
     }
-    if args.bg_removal {
-        cfg.bg_removal = true;
+    if args.no_bg_removal {
+        cfg.bg_removal = false;
     }
     if let Some(bg_color) = args.bg_color {
         cfg.bg_color = bg_color;
@@ -152,7 +161,8 @@ fn main() {
         cfg.color_mode = color_mode;
     }
 
-    // Auto-enable color output when using a non-original color mode
+    // Auto-enable color output when color_mode is anything other than "original"
+    // (matrix, cyberpunk, mono-green, etc. all need ANSI colors to display)
     if cfg.color_mode != "original" {
         cfg.color = true;
     }
@@ -160,13 +170,9 @@ fn main() {
     // Parse derived values
     let bg_color = cfg.bg_color_rgb();
 
-    // Build theme and renderer
-    let theme = if let Some(ref custom) = cfg.custom_theme {
-        custom.to_theme().unwrap_or_else(|| build_theme(&cfg.theme, &cfg.color_mode))
-    } else {
-        build_theme(&cfg.theme, &cfg.color_mode)
-    };
-    let renderer = Arc::new(ThemeRenderer::new(&theme));
+    // Build theme renderer
+    let theme_obj = theme::build_theme(&cfg.theme, &cfg.color_mode);
+    let theme_renderer = Arc::new(theme::ThemeRenderer::new(&theme_obj));
 
     // ── Terminal dimensions ───────────────────────────────────────────────
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -216,8 +222,9 @@ fn main() {
 
     // ── Shared state ──────────────────────────────────────────────────────
     let peer_connected = Arc::new(AtomicBool::new(false));
-    let peer_w = Arc::new(AtomicU32::new(half_w));
-    let peer_h = Arc::new(AtomicU32::new(height));
+    // Initialize to 0 - we'll wait for peer config before encoding video
+    let peer_w = Arc::new(AtomicU32::new(0));
+    let peer_h = Arc::new(AtomicU32::new(0));
 
     // ── Channels ──────────────────────────────────────────────────────────
     let (display_tx, display_rx) = bounded::<video::RawFrame>(2);
@@ -259,9 +266,9 @@ fn main() {
         let ph = peer_h.clone();
         let bgs = bg_session.clone();
         let video_cfg = video::VideoConfig::from(&cfg);
-        let rend = renderer.clone();
+        let renderer = theme_renderer.clone();
         thread::spawn(move || {
-            video::net_encode_thread(net_raw_rx, vid_tx, pw, ph, color, bgs, bg_color, video_cfg, rend)
+            video::net_encode_thread(net_raw_rx, vid_tx, pw, ph, color, bgs, bg_color, video_cfg, renderer)
         });
     }
 
@@ -271,7 +278,7 @@ fn main() {
         let color = cfg.color;
         let bgs = bg_session.clone();
         let video_cfg = video::VideoConfig::from(&cfg);
-        let rend = renderer.clone();
+        let renderer = theme_renderer.clone();
         thread::spawn(move || {
             video::compositor_thread(
                 display_rx,
@@ -283,7 +290,7 @@ fn main() {
                 bgs,
                 bg_color,
                 video_cfg,
-                rend,
+                renderer,
             )
         });
     }

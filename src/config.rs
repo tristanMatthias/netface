@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::theme::CustomThemeConfig;
-
 /// All configurable parameters for netface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -23,16 +21,12 @@ pub struct Config {
     /// Terminal character aspect ratio (chars are typically 2x taller than wide).
     pub char_aspect: f32,
 
-    // ─── Theme Settings ─────────────────────────────────────────────────────
-    /// Character theme name (classic, blocks, dots, emoji-faces, etc.).
+    // ─── Theme Settings ────────────────────────────────────────────────────
+    /// Character theme name (classic, detailed, blocks, dots, emoji-moon, etc.).
     pub theme: String,
 
     /// Color mode name (original, mono-green, matrix, cyberpunk, etc.).
     pub color_mode: String,
-
-    /// Custom theme configuration (overrides theme/color_mode if set).
-    #[serde(default)]
-    pub custom_theme: Option<CustomThemeConfig>,
 
     // ─── Background Removal ─────────────────────────────────────────────────
     /// Enable background removal.
@@ -84,16 +78,15 @@ impl Default for Config {
         Self {
             // Video
             fps: 15,
-            color: false,
+            color: true,
             char_aspect: 2.0,
 
             // Theme
             theme: "detailed".to_string(),
-            color_mode: "matrix".to_string(),
-            custom_theme: None,
+            color_mode: "original".to_string(),
 
             // Background removal
-            bg_removal: false,
+            bg_removal: true,
             bg_color: "000000".to_string(),
             contrast: 1.15,
             contrast_midpoint: 128.0,
@@ -103,7 +96,7 @@ impl Default for Config {
 
             // Network
             port: 4444,
-            config_interval: 60,
+            config_interval: 10,
 
             // Audio
             no_audio: false,
@@ -196,36 +189,15 @@ pub fn example_config() -> &'static str {
 fps = 15
 
 # Enable ANSI truecolor output (richer colors, larger packets)
-color = false
+color = true
 
 # Terminal character aspect ratio (chars are typically 2x taller than wide)
 char_aspect = 2.0
 
-# ─── Theme Settings ─────────────────────────────────────────────────────────
-
-# Character theme: classic, detailed, blocks, dots, emoji-moon, emoji-hearts,
-#                  emoji-fire
-theme = "detailed"
-
-# Color mode: original, mono-white, mono-green, mono-amber, matrix, sunset,
-#             cyberpunk, ice, sepia, cool
-color_mode = "matrix"
-
-# Custom theme (uncomment to use, overrides theme/color_mode above)
-# [custom_theme]
-# chars = " .:-=+*#%@"
-# color_mode = "gradient"           # original, monochrome, gradient, palette, tint
-# color_dark = "000000"             # For gradient mode
-# color_light = "00ff00"            # For gradient mode
-# color = "00ff00"                  # For monochrome mode
-# palette = ["000000", "ff0000", "ffff00", "ffffff"]  # For palette mode
-# hue_shift = 30.0                  # For tint mode (0-360)
-# saturation = 0.5                  # For tint mode (0-1)
-
 # ─── Background Removal ─────────────────────────────────────────────────────
 
 # Enable background removal (requires more CPU)
-bg_removal = false
+bg_removal = true
 
 # Background replacement color (hex RGB)
 bg_color = "000000"
