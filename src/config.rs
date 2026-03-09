@@ -71,6 +71,78 @@ pub struct Config {
     // ─── Model Settings ─────────────────────────────────────────────────────
     /// Number of threads for ONNX inference.
     pub model_threads: usize,
+
+    // ─── Identity Settings ──────────────────────────────────────────────────
+    /// Registered handle for this identity.
+    #[serde(default)]
+    pub identity: IdentityConfig,
+
+    // ─── Nostr Settings ─────────────────────────────────────────────────────
+    /// Nostr relay configuration.
+    #[serde(default)]
+    pub nostr: NostrConfig,
+
+    // ─── ICE Settings ───────────────────────────────────────────────────────
+    /// ICE/STUN configuration.
+    #[serde(default)]
+    pub ice: IceConfig,
+
+    // ─── TURN Settings ──────────────────────────────────────────────────────
+    /// Optional TURN server configuration.
+    #[serde(default)]
+    pub turn: Option<TurnConfig>,
+}
+
+/// Identity configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IdentityConfig {
+    /// Registered handle (e.g., "alice").
+    pub handle: Option<String>,
+}
+
+/// Nostr relay configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NostrConfig {
+    /// List of relay URLs.
+    pub relays: Vec<String>,
+}
+
+impl Default for NostrConfig {
+    fn default() -> Self {
+        Self {
+            relays: vec![
+                "wss://relay.damus.io".to_string(),
+                "wss://nos.lol".to_string(),
+                "wss://relay.nostr.band".to_string(),
+            ],
+        }
+    }
+}
+
+/// ICE/STUN configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IceConfig {
+    /// STUN server URLs.
+    pub stun_servers: Vec<String>,
+}
+
+impl Default for IceConfig {
+    fn default() -> Self {
+        Self {
+            stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+        }
+    }
+}
+
+/// TURN server configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnConfig {
+    /// TURN server URL.
+    pub url: String,
+    /// TURN username.
+    pub username: String,
+    /// TURN credential/password.
+    pub credential: String,
 }
 
 impl Default for Config {
@@ -107,6 +179,18 @@ impl Default for Config {
 
             // Model
             model_threads: 2,
+
+            // Identity
+            identity: IdentityConfig::default(),
+
+            // Nostr
+            nostr: NostrConfig::default(),
+
+            // ICE
+            ice: IceConfig::default(),
+
+            // TURN
+            turn: None,
         }
     }
 }
@@ -220,7 +304,7 @@ mask_threshold = 0.5
 
 # ─── Network Settings ───────────────────────────────────────────────────────
 
-# Local UDP port to listen on
+# Local UDP port to listen on (for legacy --peer mode)
 port = 4444
 
 # Config packet send interval (frames between sending resolution info)
@@ -243,5 +327,35 @@ camera = 0
 
 # Number of threads for ONNX model inference
 model_threads = 2
+
+# ─── Identity Settings ──────────────────────────────────────────────────────
+
+[identity]
+# Your registered handle (without @)
+# handle = "yourhandle"
+
+# ─── Nostr Settings ─────────────────────────────────────────────────────────
+
+[nostr]
+# Relays to use for discovery and signaling
+relays = [
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.nostr.band",
+]
+
+# ─── ICE Settings ───────────────────────────────────────────────────────────
+
+[ice]
+# STUN servers for NAT traversal
+stun_servers = ["stun:stun.l.google.com:19302"]
+
+# ─── TURN Settings (optional) ───────────────────────────────────────────────
+
+# Uncomment to enable TURN relay for difficult NAT situations
+# [turn]
+# url = "turn:relay.metered.ca:80"
+# username = ""
+# credential = ""
 "#
 }

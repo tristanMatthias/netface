@@ -17,7 +17,7 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 use keys::{handle_key_event, handle_modal_key_event, KeyAction};
-use widgets::{HelpOverlay, PickerModal, StatusBar, VideoPanel};
+use widgets::{HelpOverlay, LogViewer, PickerModal, StatusBar, VideoPanel};
 use crate::theme::{self, ThemeRenderer};
 
 /// Which modal is currently open.
@@ -26,6 +26,7 @@ pub enum ModalState {
     None,
     ThemePicker,
     ColorPicker,
+    LogViewer,
 }
 
 /// Application state for the TUI.
@@ -54,6 +55,10 @@ pub struct App {
     pub should_quit: bool,
     pub modal_state: ModalState,
     pub modal_selection: usize,
+
+    // Log viewer state
+    pub log_lines: Vec<String>,
+    pub log_scroll: usize,
 }
 
 impl App {
@@ -84,6 +89,8 @@ impl App {
             should_quit: false,
             modal_state: ModalState::None,
             modal_selection: 0,
+            log_lines: Vec::new(),
+            log_scroll: 0,
         }
     }
 
@@ -124,20 +131,47 @@ impl App {
                     .position(|&m| m == self.current_color_mode)
                     .unwrap_or(0);
             }
+            KeyAction::OpenLogViewer => {
+                self.modal_state = ModalState::LogViewer;
+                // Load logs and scroll to end
+                self.log_lines = crate::logging::read_all_lines();
+                self.log_scroll = self.log_lines.len().saturating_sub(1);
+            }
             KeyAction::ModalUp => {
-                if self.modal_selection > 0 {
+                if self.modal_state == ModalState::LogViewer {
+                    self.log_scroll = self.log_scroll.saturating_sub(1);
+                } else if self.modal_selection > 0 {
                     self.modal_selection -= 1;
                 }
             }
             KeyAction::ModalDown => {
-                let max = match self.modal_state {
-                    ModalState::ThemePicker => theme::list_char_ramps().len().saturating_sub(1),
-                    ModalState::ColorPicker => theme::list_color_modes().len().saturating_sub(1),
-                    ModalState::None => 0,
-                };
-                if self.modal_selection < max {
-                    self.modal_selection += 1;
+                if self.modal_state == ModalState::LogViewer {
+                    if self.log_scroll < self.log_lines.len().saturating_sub(1) {
+                        self.log_scroll += 1;
+                    }
+                } else {
+                    let max = match self.modal_state {
+                        ModalState::ThemePicker => theme::list_char_ramps().len().saturating_sub(1),
+                        ModalState::ColorPicker => theme::list_color_modes().len().saturating_sub(1),
+                        _ => 0,
+                    };
+                    if self.modal_selection < max {
+                        self.modal_selection += 1;
+                    }
                 }
+            }
+            KeyAction::ModalPageUp => {
+                self.log_scroll = self.log_scroll.saturating_sub(20);
+            }
+            KeyAction::ModalPageDown => {
+                let max = self.log_lines.len().saturating_sub(1);
+                self.log_scroll = (self.log_scroll + 20).min(max);
+            }
+            KeyAction::ModalHome => {
+                self.log_scroll = 0;
+            }
+            KeyAction::ModalEnd => {
+                self.log_scroll = self.log_lines.len().saturating_sub(1);
             }
             KeyAction::ModalSelect => {
                 match self.modal_state {
@@ -154,6 +188,10 @@ impl App {
                             self.current_color_mode = new_mode.to_string();
                             self.update_theme();
                         }
+                    }
+                    ModalState::LogViewer => {
+                        // Enter/space in log viewer does nothing, but we don't close it
+                        return;
                     }
                     ModalState::None => {}
                 }
@@ -304,6 +342,10 @@ fn render(frame: &mut Frame, app: &App) {
                 &app.current_color_mode,
             );
             modal.render(area, frame.buffer_mut());
+        }
+        ModalState::LogViewer => {
+            let viewer = LogViewer::new(&app.log_lines, app.log_scroll);
+            viewer.render(area, frame.buffer_mut());
         }
         ModalState::None => {}
     }

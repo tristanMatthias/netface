@@ -202,7 +202,7 @@ impl Widget for HelpOverlay {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Calculate centered box
         let box_width = 40u16;
-        let box_height = 13u16;
+        let box_height = 14u16;
         let box_x = area.x + (area.width.saturating_sub(box_width)) / 2;
         let box_y = area.y + (area.height.saturating_sub(box_height)) / 2;
 
@@ -249,6 +249,7 @@ impl Widget for HelpOverlay {
             ("b", "Toggle background removal"),
             ("t", "Change character theme"),
             ("c", "Change color mode"),
+            ("l", "View logs"),
             ("?", "Toggle this help"),
         ];
 
@@ -268,6 +269,121 @@ impl<'a> PickerModal<'a> {
             selected,
             current,
         }
+    }
+}
+
+/// Log viewer modal for viewing application logs.
+pub struct LogViewer<'a> {
+    pub lines: &'a [String],
+    pub scroll: usize,
+}
+
+impl<'a> LogViewer<'a> {
+    pub fn new(lines: &'a [String], scroll: usize) -> Self {
+        Self { lines, scroll }
+    }
+}
+
+impl Widget for LogViewer<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        // Use most of the screen
+        let margin = 2u16;
+        let box_width = area.width.saturating_sub(margin * 2);
+        let box_height = area.height.saturating_sub(margin * 2);
+        let box_x = area.x + margin;
+        let box_y = area.y + margin;
+
+        if box_width < 20 || box_height < 5 {
+            return;
+        }
+
+        // Draw background
+        for y in box_y..box_y + box_height {
+            for x in box_x..box_x + box_width {
+                buf.set_string(x, y, " ", Style::default().bg(Color::Black));
+            }
+        }
+
+        let border_style = Style::default().fg(Color::Blue);
+        let title_style = Style::default().fg(Color::Blue);
+        let log_style = Style::default().fg(Color::White);
+        let info_style = Style::default().fg(Color::Cyan);
+        let warn_style = Style::default().fg(Color::Yellow);
+        let error_style = Style::default().fg(Color::Red);
+        let debug_style = Style::default().fg(Color::DarkGray);
+        let hint_style = Style::default().fg(Color::DarkGray);
+
+        // Draw border
+        let top_y = box_y;
+        let bot_y = box_y + box_height - 1;
+        buf.set_string(box_x, top_y, "┌", border_style);
+        buf.set_string(box_x + box_width - 1, top_y, "┐", border_style);
+        buf.set_string(box_x, bot_y, "└", border_style);
+        buf.set_string(box_x + box_width - 1, bot_y, "┘", border_style);
+        for x in box_x + 1..box_x + box_width - 1 {
+            buf.set_string(x, top_y, "─", border_style);
+            buf.set_string(x, bot_y, "─", border_style);
+        }
+        for y in box_y + 1..box_y + box_height - 1 {
+            buf.set_string(box_x, y, "│", border_style);
+            buf.set_string(box_x + box_width - 1, y, "│", border_style);
+        }
+
+        // Title with log file path
+        let log_path = crate::logging::log_path();
+        let title = format!(" Logs: {} ", log_path.display());
+        let title_x = box_x + 2;
+        buf.set_string(title_x, top_y, &title, title_style);
+
+        // Scroll position indicator
+        let total_lines = self.lines.len();
+        let pos_text = format!(" {}/{} ", self.scroll + 1, total_lines.max(1));
+        let pos_x = box_x + box_width - pos_text.len() as u16 - 2;
+        buf.set_string(pos_x, top_y, &pos_text, title_style);
+
+        // Calculate visible area
+        let content_height = (box_height - 3) as usize;
+        let content_width = (box_width - 4) as usize;
+
+        // Calculate which lines to show (scroll to show scroll position near bottom)
+        let start_line = self.scroll.saturating_sub(content_height.saturating_sub(1));
+        let end_line = (start_line + content_height).min(self.lines.len());
+
+        // Render log lines
+        for (i, line_idx) in (start_line..end_line).enumerate() {
+            let y = box_y + 1 + i as u16;
+            let line = &self.lines[line_idx];
+
+            // Truncate line to fit
+            let display_line: String = line.chars().take(content_width).collect();
+
+            // Color based on log level
+            let style = if line.contains("[ERROR]") {
+                error_style
+            } else if line.contains("[WARN]") {
+                warn_style
+            } else if line.contains("[INFO]") {
+                info_style
+            } else if line.contains("[DEBUG]") {
+                debug_style
+            } else {
+                log_style
+            };
+
+            // Highlight the current scroll position line
+            let final_style = if line_idx == self.scroll {
+                style.bg(Color::Rgb(30, 30, 50))
+            } else {
+                style
+            };
+
+            buf.set_string(box_x + 2, y, &display_line, final_style);
+        }
+
+        // Hint bar
+        let hint = "↑↓ scroll  PgUp/PgDn page  g/G start/end  q close";
+        let hint_x = box_x + (box_width.saturating_sub(hint.len() as u16)) / 2;
+        buf.set_string(hint_x, bot_y, hint, hint_style);
     }
 }
 

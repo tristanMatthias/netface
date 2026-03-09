@@ -19,10 +19,20 @@ pub enum KeyAction {
     OpenThemePicker,
     /// Open color mode picker modal.
     OpenColorPicker,
+    /// Open log viewer modal.
+    OpenLogViewer,
     /// Navigate up in modal.
     ModalUp,
     /// Navigate down in modal.
     ModalDown,
+    /// Page up in modal (for log viewer).
+    ModalPageUp,
+    /// Page down in modal (for log viewer).
+    ModalPageDown,
+    /// Jump to end (for log viewer).
+    ModalEnd,
+    /// Jump to start (for log viewer).
+    ModalHome,
     /// Select current item in modal.
     ModalSelect,
     /// Close modal.
@@ -56,6 +66,9 @@ pub fn handle_key_event(key: KeyEvent) -> KeyAction {
         // Open color picker
         KeyCode::Char('c') => KeyAction::OpenColorPicker,
 
+        // Open log viewer
+        KeyCode::Char('l') => KeyAction::OpenLogViewer,
+
         _ => KeyAction::None,
     }
 }
@@ -69,6 +82,12 @@ pub fn handle_modal_key_event(key: KeyEvent) -> KeyAction {
         // Navigate
         KeyCode::Up | KeyCode::Char('k') => KeyAction::ModalUp,
         KeyCode::Down | KeyCode::Char('j') => KeyAction::ModalDown,
+
+        // Page navigation (for log viewer)
+        KeyCode::PageUp => KeyAction::ModalPageUp,
+        KeyCode::PageDown => KeyAction::ModalPageDown,
+        KeyCode::Home | KeyCode::Char('g') => KeyAction::ModalHome,
+        KeyCode::End | KeyCode::Char('G') => KeyAction::ModalEnd,
 
         // Select
         KeyCode::Enter | KeyCode::Char(' ') => KeyAction::ModalSelect,
