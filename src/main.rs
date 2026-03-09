@@ -13,14 +13,15 @@
 //   Settings are loaded from ~/.config/netface/config.toml
 //   Run with --init-config to create a default config file.
 
-use std::io::Write;
 use std::net::UdpSocket;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU32},
+    Arc, RwLock,
 };
 use std::thread;
-use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 use clap::Parser;
 use crossbeam_channel::bounded;
@@ -29,6 +30,7 @@ mod audio;
 mod config;
 mod net;
 mod theme;
+mod ui;
 mod video;
 
 use config::Config;
@@ -170,28 +172,20 @@ fn main() {
     // Parse derived values
     let bg_color = cfg.bg_color_rgb();
 
-    // Build theme renderer
+    // Build theme renderer (wrapped in RwLock for runtime updates)
     let theme_obj = theme::build_theme(&cfg.theme, &cfg.color_mode);
-    let theme_renderer = Arc::new(theme::ThemeRenderer::new(&theme_obj));
+    let theme_renderer = Arc::new(RwLock::new(theme::ThemeRenderer::new(&theme_obj)));
+    let current_theme = cfg.theme.clone();
+    let current_color_mode = cfg.color_mode.clone();
 
     // ── Terminal dimensions ───────────────────────────────────────────────
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let term_cols = term_cols as u32;
     let term_rows = term_rows as u32;
 
+    // Reserve one row for status bar
     let half_w = term_cols.saturating_sub(1) / 2;
     let height = term_rows.saturating_sub(1);
-
-    // ── Terminal setup ────────────────────────────────────────────────────
-    print!("\x1b[?25l\x1b[2J\x1b[H");
-    std::io::stdout().flush().unwrap();
-
-    ctrlc::set_handler(|| {
-        print!("\x1b[?25h\x1b[2J\x1b[H");
-        std::io::stdout().flush().ok();
-        std::process::exit(0);
-    })
-    .expect("failed to set Ctrl-C handler");
 
     // ── Network ───────────────────────────────────────────────────────────
     let peer_addr: std::net::SocketAddr = peer_str
@@ -206,22 +200,19 @@ fn main() {
 
     // ── Background removal ─────────────────────────────────────────────────
     let bg_session: Option<Arc<std::sync::Mutex<ort::session::Session>>> = if cfg.bg_removal {
-        match video::load_bg_session(cfg.model_threads) {
-            Ok(s) => {
-                eprintln!("Background removal enabled");
-                Some(Arc::new(std::sync::Mutex::new(s)))
-            }
-            Err(e) => {
-                eprintln!("Failed to load background model: {e}");
-                None
-            }
-        }
+        video::load_bg_session(cfg.model_threads)
+            .ok()
+            .map(|s| Arc::new(std::sync::Mutex::new(s)))
     } else {
         None
     };
 
     // ── Shared state ──────────────────────────────────────────────────────
     let peer_connected = Arc::new(AtomicBool::new(false));
+    let audio_muted = Arc::new(AtomicBool::new(false));
+    let video_disabled = Arc::new(AtomicBool::new(false));
+    // Background removal toggle (only effective if bg_session is Some)
+    let bg_enabled = Arc::new(AtomicBool::new(bg_session.is_some()));
     // Initialize to 0 - we'll wait for peer config before encoding video
     let peer_w = Arc::new(AtomicU32::new(0));
     let peer_h = Arc::new(AtomicU32::new(0));
@@ -233,6 +224,10 @@ fn main() {
     let (remote_vid_tx, remote_vid_rx) = bounded::<Vec<u8>>(2);
     let (local_aud_tx, local_aud_rx) = bounded::<Vec<u8>>(32);
     let (remote_aud_tx, remote_aud_rx) = bounded::<Vec<u8>>(32);
+
+    // UI channels for ASCII frames
+    let (local_ascii_tx, local_ascii_rx) = bounded::<Vec<u8>>(2);
+    let (remote_ascii_tx, remote_ascii_rx) = bounded::<Vec<u8>>(2);
 
     // ── Network receive ───────────────────────────────────────────────────
     {
@@ -267,23 +262,31 @@ fn main() {
         let bgs = bg_session.clone();
         let video_cfg = video::VideoConfig::from(&cfg);
         let renderer = theme_renderer.clone();
+        let vid_disabled = video_disabled.clone();
+        let bg_on = bg_enabled.clone();
         thread::spawn(move || {
-            video::net_encode_thread(net_raw_rx, vid_tx, pw, ph, color, bgs, bg_color, video_cfg, renderer)
+            video::net_encode_thread(
+                net_raw_rx, vid_tx, pw, ph, vid_disabled, bg_on, color, bgs, bg_color, video_cfg, renderer,
+            )
         });
     }
 
-    // ── Compositor ────────────────────────────────────────────────────────
+    // ── Local render (for UI) ─────────────────────────────────────────────
     {
         let pc = peer_connected.clone();
+        let vid_disabled = video_disabled.clone();
+        let bg_on = bg_enabled.clone();
         let color = cfg.color;
         let bgs = bg_session.clone();
         let video_cfg = video::VideoConfig::from(&cfg);
         let renderer = theme_renderer.clone();
         thread::spawn(move || {
-            video::compositor_thread(
+            video::local_render_thread(
                 display_rx,
-                remote_vid_rx,
+                local_ascii_tx,
                 pc,
+                vid_disabled,
+                bg_on,
                 half_w,
                 height,
                 color,
@@ -295,36 +298,58 @@ fn main() {
         });
     }
 
-    // ── Audio ─────────────────────────────────────────────────────────────
-    if !cfg.no_audio {
-        let audio_buffer = cfg.audio_buffer_size;
-        thread::spawn(move || audio::audio_loop(local_aud_tx, remote_aud_rx, audio_buffer));
-    }
-
-    // ── Status bar ────────────────────────────────────────────────────────
+    // ── Remote decode (for UI) ────────────────────────────────────────────
     {
-        let peer = peer_str.clone();
-        let port = cfg.port;
         let pc = peer_connected.clone();
-        let status_row = term_rows as u16;
-
-        thread::spawn(move || loop {
-            let msg = if pc.load(Ordering::Relaxed) {
-                format!(
-                    "\x1b[90mConnected  \u{2502}  peer={peer}  \u{2502}  Ctrl-C to quit\x1b[0m"
-                )
-            } else {
-                format!(
-                    "\x1b[90mWaiting for peer on :{port}  \u{2502}  Ctrl-C to quit\x1b[0m"
-                )
-            };
-            print!("\x1b[{status_row};1H\x1b[2K{msg}");
-            std::io::stdout().flush().ok();
-            thread::sleep(Duration::from_millis(500));
+        thread::spawn(move || {
+            video::remote_decode_thread(remote_vid_rx, remote_ascii_tx, pc)
         });
     }
 
-    loop {
-        thread::sleep(Duration::from_secs(60));
+    // ── Audio ─────────────────────────────────────────────────────────────
+    if !cfg.no_audio {
+        let audio_buffer = cfg.audio_buffer_size;
+        let muted = audio_muted.clone();
+        thread::spawn(move || audio::audio_loop(local_aud_tx, remote_aud_rx, audio_buffer, muted));
+    }
+
+    // ── Redirect stderr to suppress library warnings ───────────────────────
+    // AVFoundation and other libraries print warnings to stderr which corrupt the TUI
+    #[cfg(unix)]
+    let _stderr_guard = {
+        use std::fs::File;
+        let dev_null = File::open("/dev/null").ok();
+        if let Some(ref null) = dev_null {
+            unsafe {
+                libc::dup2(null.as_raw_fd(), libc::STDERR_FILENO);
+            }
+        }
+        dev_null
+    };
+
+    // ── Initialize ratatui terminal ───────────────────────────────────────
+    let mut terminal = ratatui::init();
+
+    // ── Create App and run UI event loop ──────────────────────────────────
+    let mut app = ui::App::new(
+        peer_connected.clone(),
+        peer_str.clone(),
+        cfg.port,
+        audio_muted.clone(),
+        video_disabled.clone(),
+        bg_enabled.clone(),
+        theme_renderer.clone(),
+        current_theme,
+        current_color_mode,
+    );
+
+    let result = ui::run(&mut terminal, &mut app, local_ascii_rx, remote_ascii_rx);
+
+    // ── Cleanup terminal ──────────────────────────────────────────────────
+    ratatui::restore();
+
+    if let Err(e) = result {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
     }
 }

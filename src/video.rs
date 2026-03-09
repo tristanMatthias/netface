@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -530,11 +530,13 @@ pub fn net_encode_thread(
     vid_tx: Sender<Vec<u8>>,
     peer_w: Arc<AtomicU32>,
     peer_h: Arc<AtomicU32>,
+    video_disabled: Arc<AtomicBool>,
+    bg_enabled: Arc<AtomicBool>,
     color: bool,
     bg_session: Option<Arc<Mutex<Session>>>,
     bg_color: [u8; 3],
     cfg: VideoConfig,
-    renderer: Arc<ThemeRenderer>,
+    renderer: Arc<RwLock<ThemeRenderer>>,
 ) {
     let mut ascii = Vec::with_capacity(128 * 1024);
     let mut buffers = ProcessingBuffers::new();
@@ -545,6 +547,11 @@ pub fn net_encode_thread(
             Err(_) => continue,
         };
 
+        // Skip encoding if video is disabled
+        if video_disabled.load(Ordering::Relaxed) {
+            continue;
+        }
+
         let w = peer_w.load(Ordering::Relaxed);
         let h = peer_h.load(Ordering::Relaxed);
 
@@ -553,10 +560,23 @@ pub fn net_encode_thread(
             continue;
         }
 
+        // Only use bg_session if background removal is enabled
+        let active_bg = if bg_enabled.load(Ordering::Relaxed) {
+            bg_session.as_ref()
+        } else {
+            None
+        };
+
+        // Get read lock on renderer
+        let renderer_guard = match renderer.read() {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
         process_frame(
             &frame, w, h, color,
-            bg_session.as_ref(), bg_color,
-            &mut buffers, &cfg, &renderer, &mut ascii,
+            active_bg, bg_color,
+            &mut buffers, &cfg, &renderer_guard, &mut ascii,
         );
 
         let compressed = lz4_flex::compress_prepend_size(&ascii);
@@ -565,119 +585,97 @@ pub fn net_encode_thread(
 }
 
 // ---------------------------------------------------------------------------
-// Compositor thread
+// Local render thread (for UI)
 // ---------------------------------------------------------------------------
 
-/// Renders the terminal display.
-pub fn compositor_thread(
+/// Renders local camera frames to ASCII and sends to UI.
+pub fn local_render_thread(
     local_rx: Receiver<RawFrame>,
-    remote_rx: Receiver<Vec<u8>>,
+    ascii_tx: Sender<Vec<u8>>,
     peer_connected: Arc<AtomicBool>,
+    video_disabled: Arc<AtomicBool>,
+    bg_enabled: Arc<AtomicBool>,
     half_w: u32,
     height: u32,
     color: bool,
     bg_session: Option<Arc<Mutex<Session>>>,
     bg_color: [u8; 3],
     cfg: VideoConfig,
-    renderer: Arc<ThemeRenderer>,
+    renderer: Arc<RwLock<ThemeRenderer>>,
 ) {
-    use std::io::Write;
-
     let full_w = half_w * 2;
-    let sep_col = half_w as u16 + 1;
-    let remote_col = half_w as u16 + 2;
-
-    let mut stdout = std::io::BufWriter::with_capacity(512 * 1024, std::io::stdout());
-    let mut local_frame: Option<RawFrame> = None;
-    let mut remote_bytes: Option<Vec<u8>> = None;
-    let mut prev_connected = false;
     let mut ascii_buf = Vec::with_capacity(256 * 1024);
     let mut buffers = ProcessingBuffers::new();
 
     loop {
-        match local_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(f) => local_frame = Some(f),
-            Err(_) => {}
-        }
-        while let Ok(f) = local_rx.try_recv() {
-            local_frame = Some(f);
+        let frame = match local_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+
+        // Skip if video is disabled
+        if video_disabled.load(Ordering::Relaxed) {
+            // Send empty frame to clear display
+            let _ = ascii_tx.try_send(Vec::new());
+            continue;
         }
 
         let connected = peer_connected.load(Ordering::Relaxed);
+        let width = if connected { half_w } else { full_w };
 
-        if connected {
-            while let Ok(p) = remote_rx.try_recv() {
-                if let Ok(d) = lz4_flex::decompress_size_prepended(&p) {
-                    remote_bytes = Some(d);
-                }
-            }
-        }
-
-        if connected != prev_connected {
-            write!(stdout, "\x1b[2J").ok();
-            if connected {
-                draw_separator(&mut stdout, height, sep_col);
-            }
-            prev_connected = connected;
-        }
-
-        let Some(ref frame) = local_frame else {
-            stdout.flush().ok();
-            continue;
+        // Only use bg_session if background removal is enabled
+        let active_bg = if bg_enabled.load(Ordering::Relaxed) {
+            bg_session.as_ref()
+        } else {
+            None
         };
 
-        if connected {
-            process_frame(
-                frame, half_w, height, color,
-                bg_session.as_ref(), bg_color,
-                &mut buffers, &cfg, &renderer, &mut ascii_buf,
-            );
-            render_panel(&mut stdout, &ascii_buf, 1, height);
+        // Get read lock on renderer
+        let renderer_guard = match renderer.read() {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
 
-            if let Some(ref rb) = remote_bytes {
-                render_panel(&mut stdout, rb, remote_col, height);
-            }
-        } else {
-            process_frame(
-                frame, full_w, height, color,
-                bg_session.as_ref(), bg_color,
-                &mut buffers, &cfg, &renderer, &mut ascii_buf,
-            );
-            render_panel(&mut stdout, &ascii_buf, 1, height);
-        }
+        process_frame(
+            &frame,
+            width,
+            height,
+            color,
+            active_bg,
+            bg_color,
+            &mut buffers,
+            &cfg,
+            &renderer_guard,
+            &mut ascii_buf,
+        );
 
-        stdout.flush().ok();
+        let _ = ascii_tx.try_send(ascii_buf.clone());
     }
 }
 
 // ---------------------------------------------------------------------------
-// Rendering helpers
+// Remote decode thread (for UI)
 // ---------------------------------------------------------------------------
 
-/// Write ASCII bytes into terminal panel.
-#[inline]
-fn render_panel(out: &mut impl std::io::Write, bytes: &[u8], start_col: u16, height: u32) {
-    let mut row = 1u16;
-    for line in bytes.split(|&b| b == b'\n') {
-        if line.is_empty() {
+/// Decompresses remote video packets and sends to UI.
+pub fn remote_decode_thread(
+    remote_rx: Receiver<Vec<u8>>,
+    ascii_tx: Sender<Vec<u8>>,
+    peer_connected: Arc<AtomicBool>,
+) {
+    loop {
+        let packet = match remote_rx.recv() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        if !peer_connected.load(Ordering::Relaxed) {
             continue;
         }
-        let _ = write!(out, "\x1b[{row};{start_col}H");
-        let _ = out.write_all(line);
-        row += 1;
-        if row > height as u16 {
-            break;
+
+        if let Ok(decompressed) = lz4_flex::decompress_size_prepended(&packet) {
+            let _ = ascii_tx.try_send(decompressed);
         }
     }
-}
-
-/// Draw separator line.
-fn draw_separator(out: &mut impl std::io::Write, height: u32, col: u16) {
-    let _ = write!(out, "\x1b[90m");
-    for row in 1..=height as u16 {
-        let _ = write!(out, "\x1b[{row};{col}H│");
-    }
-    let _ = write!(out, "\x1b[0m");
-    let _ = out.flush();
 }
 
