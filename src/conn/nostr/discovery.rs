@@ -78,7 +78,7 @@ impl<'a> HandleRegistry<'a> {
             .limit(1);
 
         let events = self.client
-            .get_events(vec![filter], Duration::from_secs(5))
+            .get_events(vec![filter], Duration::from_millis(1500))
             .await?;
 
         // Get the most recent event

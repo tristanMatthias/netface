@@ -25,48 +25,29 @@ pub async fn wait_for_offer(
     let our_pubkey = PublicKey::from_slice(&client.identity().pubkey_bytes())
         .map_err(|e| ConnError::InvalidIdentity(e.to_string()))?;
 
-    // Look for recent signaling events to us (p-tag contains our pubkey)
-    let filter = Filter::new()
-        .kind(Kind::Custom(KIND_NETFACE_SIGNAL))
-        .pubkey(our_pubkey)
-        .since(Timestamp::now() - Duration::from_secs(120));
+    crate::log_info!("Signal: Listening for offers to {}", &our_pubkey.to_hex()[..16]);
 
     let start = std::time::Instant::now();
-    crate::log_info!("Signal: Listening for offers to {}", &our_pubkey.to_hex()[..16]);
-    crate::log_debug!("Signal: Filter kind={}, p={}", KIND_NETFACE_SIGNAL, &our_pubkey.to_hex()[..16]);
 
-    // Subscribe to ensure relays send us matching events
-    client.client().subscribe(vec![filter.clone()], None).await;
-
+    // Poll for offers - more reliable than notifications
     while start.elapsed() < timeout {
-        let events = client.get_events(vec![filter.clone()], Duration::from_secs(3)).await?;
+        // Fresh filter each time - only look at very recent offers
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_NETFACE_SIGNAL))
+            .pubkey(our_pubkey)
+            .since(Timestamp::now() - Duration::from_secs(15));
 
-        if !events.is_empty() {
-            crate::log_debug!("Signal: Got {} events", events.len());
-        }
-
-        for event in events {
-            crate::log_debug!("Signal: Event kind={}, author={}, content_len={}",
-                event.kind.as_u64(),
-                &event.author().to_hex()[..16],
-                event.content.len());
-
-            // Try to parse as a signaling message
-            match SignalMessage::from_json(&event.content) {
-                Ok(SignalMessage::CallOffer { call_id, sdp }) => {
+        if let Ok(events) = client.get_events(vec![filter], Duration::from_millis(500)).await {
+            // Get most recent offer
+            for event in events {
+                if let Ok(SignalMessage::CallOffer { call_id, sdp }) = SignalMessage::from_json(&event.content) {
                     crate::log_info!("Signal: Received offer from {}", &event.author().to_hex()[..16]);
                     return Ok((event.author(), call_id, sdp));
-                }
-                Ok(other) => {
-                    crate::log_debug!("Signal: Got other signal type: {:?}", std::mem::discriminant(&other));
-                }
-                Err(e) => {
-                    crate::log_debug!("Signal: Failed to parse event: {}", e);
                 }
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
     Err(ConnError::SignalingTimeout)
@@ -82,28 +63,31 @@ pub async fn wait_for_answer(
     let our_pubkey = PublicKey::from_slice(&client.identity().pubkey_bytes())
         .map_err(|e| ConnError::InvalidIdentity(e.to_string()))?;
 
-    let filter = Filter::new()
-        .kind(Kind::Custom(KIND_NETFACE_SIGNAL))
-        .author(*peer_pubkey)
-        .pubkey(our_pubkey)
-        .since(Timestamp::now() - Duration::from_secs(120));
-
-    let start = std::time::Instant::now();
     crate::log_info!("Signal: Waiting for answer from {}", &peer_pubkey.to_hex()[..16]);
 
-    while start.elapsed() < timeout {
-        let events = client.get_events(vec![filter.clone()], Duration::from_secs(3)).await?;
+    let start = std::time::Instant::now();
 
-        for event in events {
-            if let Ok(SignalMessage::CallAnswer { call_id: cid, sdp }) = SignalMessage::from_json(&event.content) {
-                if cid == call_id {
-                    crate::log_info!("Signal: Received answer from {}", &peer_pubkey.to_hex()[..16]);
-                    return Ok(sdp);
+    // Poll for the answer - more reliable than notifications
+    while start.elapsed() < timeout {
+        // Fresh filter each time to get recent events
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_NETFACE_SIGNAL))
+            .author(*peer_pubkey)
+            .pubkey(our_pubkey)
+            .since(Timestamp::now() - Duration::from_secs(30));
+
+        if let Ok(events) = client.get_events(vec![filter], Duration::from_millis(500)).await {
+            for event in events {
+                if let Ok(SignalMessage::CallAnswer { call_id: cid, sdp }) = SignalMessage::from_json(&event.content) {
+                    if cid == call_id {
+                        crate::log_info!("Signal: Received answer from {}", &peer_pubkey.to_hex()[..16]);
+                        return Ok(sdp);
+                    }
                 }
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
     Err(ConnError::SignalingTimeout)

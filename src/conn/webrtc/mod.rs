@@ -130,6 +130,11 @@ impl WebRtcConnection {
 
     /// Gather ICE candidates including STUN reflexive candidates.
     pub async fn gather_candidates(&mut self) -> Result<(), ConnError> {
+        // Skip if already gathered
+        if self.state != ConnectionState::New {
+            crate::log_debug!("ICE: Already gathered, skipping");
+            return Ok(());
+        }
         crate::log_debug!("ICE: Adding host candidate: {}", self.local_addr);
         let host_candidate = Candidate::host(self.local_addr, Protocol::Udp)
             .map_err(|e| ConnError::IceGathering(e.to_string()))?;
@@ -152,8 +157,8 @@ impl WebRtcConnection {
             };
 
             match tokio::time::timeout(
-                Duration::from_secs(3),
-                ice::stun_binding(&stun_socket, stun_url, Duration::from_secs(3))
+                Duration::from_millis(1500),
+                ice::stun_binding(&stun_socket, stun_url, Duration::from_millis(1500))
             ).await {
                 Ok(Ok(srflx_addr)) => {
                     crate::log_info!("ICE: Got STUN response: {}", srflx_addr);

@@ -147,6 +147,10 @@ struct Args {
     #[arg(long, short = 'v')]
     verbose: bool,
 
+    /// Update netface to the latest version
+    #[arg(long)]
+    update: bool,
+
     /// Send a test ping to a handle (for debugging signaling)
     #[arg(long)]
     ping: Option<String>,
@@ -169,6 +173,34 @@ fn main() {
     }
     log_info!("netface starting");
     log_info!("Log file: {:?}", logging::log_path());
+
+    // Self-update
+    if args.update {
+        println!("Checking for updates (current: v{})...", env!("CARGO_PKG_VERSION"));
+        match self_update::backends::github::Update::configure()
+            .repo_owner("tristanMatthias")
+            .repo_name("netface")
+            .bin_name("netface")
+            .target(self_update::get_target())
+            .show_download_progress(true)
+            .current_version(env!("CARGO_PKG_VERSION"))
+            .build()
+            .and_then(|u| u.update())
+        {
+            Ok(status) => {
+                if status.updated() {
+                    println!("Updated to v{}!", status.version());
+                } else {
+                    println!("Already up to date (v{}).", status.version());
+                }
+            }
+            Err(e) => {
+                eprintln!("Update failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     // Handle config commands
     if args.example_config {
@@ -590,6 +622,7 @@ fn setup_webrtc_transport(cfg: &Config, handle: &str, listen_mode: bool, local_w
     // Clone for the async task
     let relays = cfg.nostr.relays.clone();
     let stun_servers = cfg.ice.stun_servers.clone();
+    let turn_config = cfg.turn.clone();
     let handle_owned = handle.to_string();
     let peer_connected_clone = peer_connected.clone();
     let peer_w_clone = peer_w.clone();
@@ -599,27 +632,38 @@ fn setup_webrtc_transport(cfg: &Config, handle: &str, listen_mode: bool, local_w
     thread::spawn(move || {
         crate::log_info!("WebRTC: Starting connection thread");
         let result = conn::bridge::block_on(async {
-            // Create Nostr client
-            crate::log_debug!("WebRTC: Creating Nostr client");
-            let nostr = Arc::new(conn::nostr::NostrClient::new(identity.clone(), relays).await?);
-            crate::log_info!("WebRTC: Connecting to Nostr relays...");
-            nostr.connect().await?;
-            crate::log_info!("WebRTC: Connected to relays");
-
-            // Create WebRTC connection
-            crate::log_debug!("WebRTC: Creating WebRTC connection");
-            crate::log_debug!("WebRTC: STUN servers: {:?}", stun_servers);
+            // Create WebRTC config
             let webrtc_config = conn::webrtc::WebRtcConfig {
                 stun_servers,
-                turn_url: None,
-                turn_username: None,
-                turn_credential: None,
+                turn_url: turn_config.as_ref().map(|t| t.url.clone()),
+                turn_username: turn_config.as_ref().map(|t| t.username.clone()),
+                turn_credential: turn_config.as_ref().map(|t| t.credential.clone()),
                 ice_timeout: Duration::from_secs(10),
                 connect_timeout: Duration::from_secs(30),
             };
 
-            let mut webrtc = conn::webrtc::WebRtcConnection::new(webrtc_config).await?;
-            crate::log_info!("WebRTC: Connection created");
+            // Run Nostr connect and WebRTC setup in parallel
+            crate::log_info!("WebRTC: Starting parallel setup (Nostr + WebRTC)...");
+            let nostr_fut = async {
+                let nostr = conn::nostr::NostrClient::new(identity.clone(), relays).await?;
+                nostr.connect().await?;
+                crate::log_info!("WebRTC: Nostr connected");
+                Ok::<_, ConnError>(Arc::new(nostr))
+            };
+            let webrtc_fut = async {
+                let webrtc = conn::webrtc::WebRtcConnection::new(webrtc_config).await?;
+                crate::log_info!("WebRTC: Connection created");
+                Ok::<_, ConnError>(webrtc)
+            };
+
+            let (nostr_result, webrtc_result) = tokio::join!(nostr_fut, webrtc_fut);
+            let nostr = nostr_result?;
+            let mut webrtc = webrtc_result?;
+            crate::log_info!("WebRTC: Parallel setup complete");
+
+            // Start ICE gathering early (STUN)
+            crate::log_info!("WebRTC: Gathering ICE candidates...");
+            webrtc.gather_candidates().await?;
 
             // Create data channels
             crate::log_debug!("WebRTC: Creating data channels");
@@ -731,14 +775,14 @@ fn setup_webrtc_transport(cfg: &Config, handle: &str, listen_mode: bool, local_w
 
                 // Calculate sleep duration based on str0m's next timeout
                 let sleep_duration = if received {
-                    // If we received data, check again soon
-                    Duration::from_millis(1)
+                    // If we received data, check again immediately
+                    Duration::ZERO
                 } else if let Some(next) = next_timeout {
-                    // Sleep until str0m needs us, but cap at 50ms for responsiveness
+                    // Sleep until str0m needs us, but cap at 20ms for responsiveness
                     let until_timeout = next.saturating_duration_since(std::time::Instant::now());
-                    until_timeout.min(Duration::from_millis(50))
+                    until_timeout.min(Duration::from_millis(20))
                 } else {
-                    Duration::from_millis(10)
+                    Duration::from_millis(5)
                 };
 
                 tokio::time::sleep(sleep_duration).await;

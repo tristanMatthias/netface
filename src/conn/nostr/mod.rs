@@ -55,8 +55,8 @@ impl NostrClient {
 
         self.client.connect().await;
 
-        // Wait for at least one relay to connect
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Very brief wait - relays connect async in background
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         Ok(())
     }
@@ -82,15 +82,28 @@ impl NostrClient {
         hex::encode(self.identity.pubkey_bytes())
     }
 
-    /// Publish an event.
+    /// Publish an event with timeout to avoid blocking on slow relays.
     pub async fn publish(&self, event: Event) -> Result<EventId, ConnError> {
         crate::log_debug!("Nostr: Publishing event kind={}", event.kind.as_u64());
-        let event_id = self.client
-            .send_event(event)
-            .await
-            .map_err(|e| ConnError::PublishFailed(e.to_string()))?;
+        let event_id = event.id;
 
-        crate::log_info!("Nostr: Published event {}", &event_id.to_hex()[..16]);
+        // Wait for at least some relay confirmations, but don't block too long
+        match tokio::time::timeout(
+            Duration::from_secs(3),
+            self.client.send_event(event)
+        ).await {
+            Ok(Ok(_)) => {
+                crate::log_info!("Nostr: Published event {}", &event_id.to_hex()[..16]);
+            }
+            Ok(Err(e)) => {
+                crate::log_warn!("Nostr: Publish error (continuing): {}", e);
+            }
+            Err(_) => {
+                // Timeout is fine - event was likely sent to at least one relay
+                crate::log_debug!("Nostr: Publish timeout (event likely sent)");
+            }
+        }
+
         Ok(event_id)
     }
 
