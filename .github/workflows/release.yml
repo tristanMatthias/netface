@@ -21,8 +21,8 @@ jobs:
             target: aarch64-apple-darwin
             artifact: netface
 
-          # macOS Intel
-          - os: macos-13
+          # macOS Intel (cross-compiled from ARM runner)
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: netface
 
