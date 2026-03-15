@@ -26,13 +26,13 @@ jobs:
             target: x86_64-apple-darwin
             artifact: netface
 
-          # Linux x86_64 — native
-          - os: ubuntu-22.04
+          # Linux x86_64 — native (ubuntu-24.04 has glibc 2.39, required by ort prebuilt)
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact: netface
 
-          # Linux ARM64 — native ARM runner (no cross-compilation needed)
-          - os: ubuntu-22.04-arm
+          # Linux ARM64 — native ARM runner (ubuntu-24.04 has glibc 2.39, required by ort prebuilt)
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: netface
 
@@ -67,6 +67,7 @@ jobs:
           sudo apt-get install -y \
             libasound2-dev \
             libv4l-dev \
+            libstdc++-14-dev \
             pkg-config
 
       - name: Build
